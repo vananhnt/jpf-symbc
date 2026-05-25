@@ -109,7 +109,7 @@ public class SymbolicStringHandler {
 			int numStackSlots = invInst.getArgSize();
 
 			for (int i = 0; i < numStackSlots; i++) {
-				Expression sym_v1 = (Expression) sf.getOperandAttr(i);
+				Expression sym_v1 = sf.getOperandAttr(i, Expression.class);
 				if (sym_v1 != null) {
 					if (sym_v1 instanceof SymbolicStringBuilder) { // check if
 						// StringBuilder has
@@ -386,7 +386,7 @@ public class SymbolicStringHandler {
 		StringExpression sym_v1 = null;
 		Expression sym_v2 = null; // could be String or Char
 		sym_v1 = (StringExpression)sf.getOperandAttr(1);
-		sym_v2 = (Expression) sf.getOperandAttr(0);
+		sym_v2 = sf.getOperandAttr(0, Expression.class);
 		if (sym_v1 == null && sym_v2 == null) {
 			throw new RuntimeException("ERROR: symbolic string method must have one symbolic operand: HandleIndexOf1");
 		} else {
@@ -442,7 +442,7 @@ public class SymbolicStringHandler {
 		IntegerExpression intExp = null;
 		sym_v1 = (StringExpression) sf.getOperandAttr(2);
 		intExp = (IntegerExpression) sf.getOperandAttr(0);
-		sym_v2 = (Expression) sf.getOperandAttr(1);
+		sym_v2 = sf.getOperandAttr(1, Expression.class);
 
 		if (sym_v1 == null && sym_v2 == null && intExp == null) {
 			throw new RuntimeException("ERROR: symbolic string method must have one symbolic operand: HandleIndexOf2");
@@ -693,7 +693,7 @@ public class SymbolicStringHandler {
 
 	public void handlebooleanValue(JVMInvokeInstruction invInst, SystemState ss, ThreadInfo th) {
 		StackFrame sf = th.getModifiableTopFrame();
-		Expression sym_v3 = (Expression) sf.getOperandAttr(0);
+		Expression sym_v3 = sf.getOperandAttr(0, Expression.class);
 
 		if (sym_v3 == null) {
 			throw new RuntimeException("ERROR: symbolic string method must have one symbolic operand: HandlebooleanValue");
@@ -713,7 +713,7 @@ public class SymbolicStringHandler {
 
 	public void handleintValue(JVMInvokeInstruction invInst,  ThreadInfo th) {
 		StackFrame sf = th.getModifiableTopFrame();
-		Expression sym_v3 = (Expression) sf.getOperandAttr(0);
+		Expression sym_v3 = sf.getOperandAttr(0, Expression.class);
 
 		if (sym_v3 == null) {
 			throw new RuntimeException("ERROR: symbolic string method must have one symbolic operand: HandleintValue");
@@ -732,7 +732,7 @@ public class SymbolicStringHandler {
 
 	public void handlelongValue(JVMInvokeInstruction invInst,  ThreadInfo th) {
 		StackFrame sf = th.getModifiableTopFrame();
-		Expression sym_v3 = (Expression) sf.getOperandAttr(0);
+		Expression sym_v3 = sf.getOperandAttr(0, Expression.class);
 
 		if (sym_v3 == null) {
 			throw new RuntimeException("ERROR: symbolic string method must have one symbolic operand: hanldeLongValue");
@@ -752,7 +752,7 @@ public class SymbolicStringHandler {
 
 	public void handlefloatValue(JVMInvokeInstruction invInst,  ThreadInfo th) {
 		StackFrame sf = th.getModifiableTopFrame();
-		Expression sym_v3 = (Expression) sf.getOperandAttr(0);
+		Expression sym_v3 = sf.getOperandAttr(0, Expression.class);
 
 		if (sym_v3 == null) {
 			throw new RuntimeException("ERROR: symbolic method must have symbolic string operand: hanldeFloatValue");
@@ -772,7 +772,7 @@ public class SymbolicStringHandler {
 
 	public void handledoubleValue(JVMInvokeInstruction invInst,  ThreadInfo th) {
 		StackFrame sf = th.getModifiableTopFrame();
-		Expression sym_v3 = (Expression) sf.getOperandAttr(0);
+		Expression sym_v3 = sf.getOperandAttr(0, Expression.class);
 
 		if (sym_v3 == null) {
 			throw new RuntimeException("ERROR: symbolic method must have symbolic string operand: hanldeDoubleValue");
@@ -1297,7 +1297,7 @@ public class SymbolicStringHandler {
 
 	public void handleParseLongValueOf(JVMInvokeInstruction invInst,  ThreadInfo th) {
 		StackFrame sf = th.getModifiableTopFrame();
-		Expression sym_v3 = (Expression) sf.getOperandAttr(0);
+		Expression sym_v3 = sf.getOperandAttr(0, Expression.class);
 
 		if (sym_v3 == null) {
 			throw new RuntimeException("ERROR: symbolic method must have symbolic string operand");
@@ -1360,7 +1360,7 @@ public class SymbolicStringHandler {
 
 	public void handleParseBooleanValueOf(JVMInvokeInstruction invInst, ThreadInfo th) {
 		StackFrame sf = th.getModifiableTopFrame();
-		Expression sym_v3 = (Expression) sf.getOperandAttr(0);
+		Expression sym_v3 = sf.getOperandAttr(0, Expression.class);
 
 		if (sym_v3 == null) {
 			throw new RuntimeException("ERROR: symbolic method must have symbolic string operand");
@@ -1424,7 +1424,7 @@ public class SymbolicStringHandler {
 
 	public void handleParseIntValueOf(JVMInvokeInstruction invInst, ThreadInfo th) {
 		StackFrame sf = th.getModifiableTopFrame();
-		Expression sym_v3 = (Expression) sf.getOperandAttr(0);
+		Expression sym_v3 = sf.getOperandAttr(0, Expression.class);
 
 		if (sym_v3 == null) {
 			throw new RuntimeException("ERROR: symbolic method must have symbolic string operand");
@@ -1487,7 +1487,7 @@ public class SymbolicStringHandler {
 
 	public void handleParseInt(JVMInvokeInstruction invInst, ThreadInfo th) {
 		StackFrame sf = th.getModifiableTopFrame();
-		Expression sym_v3 = (Expression) sf.getOperandAttr(0);
+		Expression sym_v3 = sf.getOperandAttr(0, Expression.class);
 
 		if (sym_v3 == null) {
 			throw new RuntimeException("ERROR: symbolic method must have symbolic string operand");
@@ -1541,7 +1541,7 @@ public class SymbolicStringHandler {
 
 	public void handleParseFloat(JVMInvokeInstruction invInst, ThreadInfo th) {
 		StackFrame sf = th.getModifiableTopFrame();
-		Expression sym_v3 = (Expression) sf.getOperandAttr(0);
+		Expression sym_v3 = sf.getOperandAttr(0, Expression.class);
 
 		if (sym_v3 == null) {
 			throw new RuntimeException("ERROR: symbolic method must have symbolic string operand");
@@ -1594,7 +1594,7 @@ public class SymbolicStringHandler {
 
 	public void handleParseFloatValueOf(JVMInvokeInstruction invInst, ThreadInfo th) {
 		StackFrame sf = th.getModifiableTopFrame();
-		Expression sym_v3 = (Expression) sf.getOperandAttr(0);
+		Expression sym_v3 = sf.getOperandAttr(0, Expression.class);
 
 		if (sym_v3 == null) {
 			throw new RuntimeException("ERROR: symbolic method must have symbolic string operand");
@@ -1656,7 +1656,7 @@ public class SymbolicStringHandler {
 
 	public void handleParseDoubleValueOf(JVMInvokeInstruction invInst, ThreadInfo th) {
 		StackFrame sf = th.getModifiableTopFrame();
-		Expression sym_v3 = (Expression) sf.getOperandAttr(0);
+		Expression sym_v3 = sf.getOperandAttr(0, Expression.class);
 
 		if (sym_v3 == null) {
 			throw new RuntimeException("ERROR: symbolic method must have symbolic string operand");
@@ -1719,7 +1719,7 @@ public class SymbolicStringHandler {
 
 	public void handleParseDouble(JVMInvokeInstruction invInst, ThreadInfo th) {
 		StackFrame sf = th.getModifiableTopFrame();
-		Expression sym_v3 = (Expression) sf.getOperandAttr(0);
+		Expression sym_v3 = sf.getOperandAttr(0, Expression.class);
 
 		if (sym_v3 == null) {
 			throw new RuntimeException("ERROR: symbolic method must have symbolic string operand");
@@ -1775,7 +1775,7 @@ public class SymbolicStringHandler {
 
 	public void handleParseLong(JVMInvokeInstruction invInst, ThreadInfo th) {
 		StackFrame sf = th.getModifiableTopFrame();
-		Expression sym_v3 = (Expression) sf.getOperandAttr(0);
+		Expression sym_v3 = sf.getOperandAttr(0, Expression.class);
 
 		if (sym_v3 == null) {
 			throw new RuntimeException("ERROR: symbolic method must have symbolic string operand");
@@ -2026,7 +2026,7 @@ public class SymbolicStringHandler {
 
 	public Instruction handleObjectValueOf(JVMInvokeInstruction invInst, ThreadInfo th) {
 		StackFrame sf = th.getModifiableTopFrame();
-		Expression sym_v1 = (Expression) sf.getOperandAttr(0);
+		Expression sym_v1 = sf.getOperandAttr(0, Expression.class);
 		if (sym_v1 instanceof SymbolicStringBuilder) {
 			sf.pop();
 			SymbolicStringBuilder sym_v3 = (SymbolicStringBuilder) sym_v1;
@@ -2092,8 +2092,8 @@ public class SymbolicStringHandler {
 
 	public void handleObjectEquals(JVMInvokeInstruction invInst,  ThreadInfo th) {
 		StackFrame sf = th.getModifiableTopFrame();
-		Expression sym_v1 = (Expression) sf.getOperandAttr(0);
-		Expression sym_v2 = (Expression) sf.getOperandAttr(1);
+		Expression sym_v1 = sf.getOperandAttr(0, Expression.class);
+		Expression sym_v2 = sf.getOperandAttr(1, Expression.class);
 
 		if (sym_v1 != null) {
 			// System.out.println("*" + sym_v1.toString());
@@ -2625,7 +2625,7 @@ public class SymbolicStringHandler {
 	public void handleObjectAppend(JVMInvokeInstruction invInst, ThreadInfo th) {
 		StackFrame sf = th.getModifiableTopFrame();
 
-		Expression sym_v1 = (Expression) sf.getOperandAttr(0);
+		Expression sym_v1 = sf.getOperandAttr(0, Expression.class);
 		SymbolicStringBuilder sym_v2 = (SymbolicStringBuilder) sf.getOperandAttr(1);
 		// System.out.println(invInst.getSourceLocation());
 		if (sym_v2 == null)
@@ -2781,7 +2781,7 @@ public class SymbolicStringHandler {
 			sym_v1 = (Expression) sf.getLongOperandAttr();
 			flag = true;
 		} else {
-			sym_v1 = (Expression) sf.getOperandAttr(0);
+			sym_v1 = sf.getOperandAttr(0, Expression.class);
 		}
 
 		if ((sym_v1 == null)) {

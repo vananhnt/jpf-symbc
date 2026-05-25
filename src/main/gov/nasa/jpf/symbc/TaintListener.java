@@ -771,37 +771,48 @@ public class TaintListener extends PropertyListenerAdapter {
         StackFrame callerFrame = ti.getModifiableTopFrame();
         if (callerFrame == null) return;
 
-        // Guard: native methods that fail to push a return value leave the
-        // operand stack empty; addOperandAttr would assert-fail in that case.
-        if (callerFrame.getTopPos() < callerFrame.getLocalVariableCount()) return;
-
         TaintTag tag = new TaintTag(sourceSpec, mi.getFullName());
 
-        // For reference return types: if the callee returned null/0, replace it
-        // with a synthetic heap string so the tag can propagate through later
-        // ALOAD / GETFIELD / invoke instructions.
         if (mi.isReferenceReturnType()) {
-            int ref = callerFrame.peek();
-            if (ref == MJIEnv.NULL) {
+            if (mi instanceof SkippedNativeMethodInfo) {
+                // SkippedNativeMethodInfo.executeNative() returns null for all reference
+                // types; NATIVERETURN skips pushReturnValue when ret==null, so no value
+                // was pushed onto the caller's stack. Push a synthetic tainted String
+                // directly so the tag can propagate through subsequent instructions.
                 ElementInfo ei = ti.getHeap().newString("TAINTED_" + mi.getBaseName(), ti);
                 addTaint(ei, tag);
-                callerFrame.pop();
                 callerFrame.pushRef(ei.getObjectRef());
+                callerFrame.addOperandAttr(tag);
                 String allocLine = "[TaintListener] SOURCE allocated: " + mi.getBaseName();
                 System.out.println(allocLine);
                 trace(allocLine);
             } else {
-                addTaint(ti.getHeap().get(ref), tag);
+                // Regular NATIVERETURN (real peer) or ARETURN: value already on stack.
+                if (callerFrame.getTopPos() < callerFrame.getLocalVariableCount()) return;
+                int ref = callerFrame.peek();
+                if (ref == MJIEnv.NULL) {
+                    ElementInfo ei = ti.getHeap().newString("TAINTED_" + mi.getBaseName(), ti);
+                    addTaint(ei, tag);
+                    callerFrame.pop();
+                    callerFrame.pushRef(ei.getObjectRef());
+                    String allocLine = "[TaintListener] SOURCE allocated: " + mi.getBaseName();
+                    System.out.println(allocLine);
+                    trace(allocLine);
+                } else {
+                    addTaint(ti.getHeap().get(ref), tag);
+                }
+                callerFrame.addOperandAttr(tag);
             }
-        }
-
-        // For double/long (2-slot) returns, taint lives at the high-word slot
-        // (offset 1); use addLongOperandAttr so captureArithmeticTaint finds it.
-        byte retType = mi.getReturnTypeCode();
-        if (retType == Types.T_DOUBLE || retType == Types.T_LONG) {
-            callerFrame.addLongOperandAttr(tag);
         } else {
-            callerFrame.addOperandAttr(tag);
+            // Primitive return: guard against empty stack.
+            if (callerFrame.getTopPos() < callerFrame.getLocalVariableCount()) return;
+            // For double/long (2-slot) returns, taint lives at the high-word slot.
+            byte retType = mi.getReturnTypeCode();
+            if (retType == Types.T_DOUBLE || retType == Types.T_LONG) {
+                callerFrame.addLongOperandAttr(tag);
+            } else {
+                callerFrame.addOperandAttr(tag);
+            }
         }
 
         String line = "[TaintListener] SOURCE found: " + tag;

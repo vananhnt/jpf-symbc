@@ -32,7 +32,7 @@ public class I2B extends gov.nasa.jpf.jvm.bytecode.I2B {
   @Override
   public Instruction execute (ThreadInfo th) {
 	  StackFrame sf = th.getModifiableTopFrame();
-	  Expression sym_val = (Expression) sf.getOperandAttr();
+	  Expression sym_val = sf.getOperandAttr(Expression.class);
 		
 	  Instruction result = super.execute(th);
 	  //DL:TBD: I think we should add a choice here to account for possible truncation.

@@ -32,7 +32,7 @@ public class I2L extends gov.nasa.jpf.jvm.bytecode.I2L {
 
   public Instruction execute (ThreadInfo th) {
 	  StackFrame sf = th.getModifiableTopFrame();
-	  Expression sym_val = (Expression) sf.getOperandAttr();
+	  Expression sym_val = sf.getOperandAttr(Expression.class);
 		
 	  Instruction result = super.execute(th);
 	  if(sym_val != null)

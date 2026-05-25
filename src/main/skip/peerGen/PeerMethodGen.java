@@ -887,7 +887,7 @@ public class PeerMethodGen {
         this.il.append(InstructionFactory.createReturn(Type.DOUBLE));
       }
     }
-    sourceGen.printDummyReturnStatement();
+    if (genSource()) sourceGen.printDummyReturnStatement();
   }
 
   /**

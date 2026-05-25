@@ -93,10 +93,22 @@ public class PeerClassGen implements Constants {
 
   private static void init(Config config) {
     if(!initialized) {
-      peersLocation = config.getPath("jpf-nhandler") + "/onthefly/";
+      File nhandlerFile = config.getPath("jpf-nhandler");
+      if (nhandlerFile != null) {
+        peersLocation = nhandlerFile.getAbsolutePath() + "/onthefly/";
+      } else {
+        File outputFile = config.getPath("output");
+        if (outputFile != null) {
+          peersLocation = outputFile.getAbsolutePath() + "/onthefly/";
+        } else {
+          peersLocation = System.getProperty("java.io.tmpdir") + "/jpf-onthefly/";
+        }
+      }
+      new File(peersLocation).mkdirs();
       PeerSourceGen.genSource = config.getBoolean("nhandler.genSource");
       PeerSourceGen.addComment = config.getBoolean("nhandler.addComment");
       PeerMethodGen.updateJPFState = config.getBoolean("nhandler.updateJPFState", true);
+      initialized = true;
     }
   }
 
