@@ -253,6 +253,10 @@ public class BytecodeUtils {
 
             if (argsInfo != null) {
                 localVarsIdx = (isStatic ? 0 : 1); // Skip over "this" argument when non-static
+            } else if (argSize == 0) {
+                // Method has no args and javac emitted no LocalVariableTable — treat as empty.
+                argsInfo = new LocalVarInfo[0];
+                localVarsIdx = 0;
             } else {
                 throw new RuntimeException("ERROR: you need to turn debug option on");
             }
