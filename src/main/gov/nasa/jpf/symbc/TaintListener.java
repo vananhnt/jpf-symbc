@@ -348,7 +348,7 @@ public class TaintListener extends PropertyListenerAdapter {
         }
         if (insn instanceof JVMReturnInstruction) {
             handleSourceReturn(ti, (JVMReturnInstruction) insn);
-            applyNativeReturnTaint(ti, (JVMReturnInstruction) insn);
+            applyReturnTaint(ti, (JVMReturnInstruction) insn);
         }
         recordInstructionTaint(ti, insn);
     }
@@ -638,10 +638,11 @@ public class TaintListener extends PropertyListenerAdapter {
     }
 
     /**
-     * Post-exec: attach the pre-captured taint tag to the return value now sitting
-     * on the caller's operand stack.  For reference returns, also tags the heap
-     * object; if the callee returned null, allocates a synthetic tainted string
-     * so the tag can propagate through subsequent operations.
+     * Post-exec: store the pre-captured taint tag on the callee frame so that
+     * applyReturnTaint can retrieve it when the callee returns.
+     *
+     * Works for both native callees (NativeStackFrame on top, peer has run) and
+     * Java callees (fresh JVMStackFrame on top with an empty operand stack).
      */
     private void applyInvokeTaint(ThreadInfo ti, Instruction insn, TaintTag tag) {
         if (!(insn instanceof JVMInvokeInstruction)) return;
@@ -651,46 +652,23 @@ public class TaintListener extends PropertyListenerAdapter {
         StackFrame frame = ti.getModifiableTopFrame();
         if (frame == null) return;
 
-        // MJI (native) callee: setupCallee pushed a NativeStackFrame; the peer hasn't
-        // run yet.  Store the tag on the native frame so applyNativeReturnTaint can
-        // apply it after NATIVERETURN pushes the result to the caller's stack.
-        if (frame instanceof NativeStackFrame) {
-            frame.addFrameAttr(tag);
-            return;
-        }
-
-        // For Java (non-native) callees, instructionExecuted fires right after the
-        // INVOKE before the callee executes — the callee frame is now on top with
-        // an empty operand stack.  Skip in that case.
-        if (frame.getTopPos() < frame.getLocalVariableCount()) return;
-
-        if (mi.isReferenceReturnType()) {
-            int ref = frame.peek();
-            if (ref == MJIEnv.NULL) {
-                ElementInfo ei = ti.getHeap().newString("TAINTED_" + mi.getBaseName(), ti);
-                addTaint(ei, tag);
-                frame.pop();
-                frame.pushRef(ei.getObjectRef());
-            } else {
-                addTaint(ti.getHeap().get(ref), tag);
-            }
-        }
-        frame.addOperandAttr(tag);
-
-        String line = "[TaintPropag] " + mi.getFullName() + " (via-arg) => " + tag;
-        System.out.println(line);
-        trace(line);
+        // Store tag on the callee frame (NativeStackFrame for MJI methods, or fresh
+        // JVMStackFrame for Java methods with empty operand stack). applyReturnTaint
+        // will retrieve the tag at the corresponding return instruction.
+        frame.addFrameAttr(tag);
     }
 
     /**
-     * Post-exec for NATIVERETURN: if applyInvokeTaint stored a tag on the
-     * NativeStackFrame (because the peer hadn't run yet at instructionExecuted
-     * time for INVOKEVIRTUAL), apply it now that the return value is on the
-     * caller's stack.
+     * Post-exec for any return instruction: if applyInvokeTaint stored a taint tag
+     * on the callee's frame (native or Java), apply it to the return value now on
+     * the caller's operand stack.
+     *
+     * Handles both NATIVERETURN (taint-through native methods like StringBuilder.append)
+     * and regular ARETURN (taint-through Java methods like Arrays.toString).
      */
-    private void applyNativeReturnTaint(ThreadInfo ti, JVMReturnInstruction insn) {
+    private void applyReturnTaint(ThreadInfo ti, JVMReturnInstruction insn) {
         StackFrame returnFrame = insn.getReturnFrame();
-        if (!(returnFrame instanceof NativeStackFrame)) return;
+        if (returnFrame == null) return;
 
         TaintTag tag = firstTaint(returnFrame);
         if (tag == null) return;
@@ -707,10 +685,17 @@ public class TaintListener extends PropertyListenerAdapter {
             if (ref != MJIEnv.NULL) {
                 addTaint(ti.getHeap().get(ref), tag);
             }
+            callerFrame.addOperandAttr(tag);
+        } else {
+            byte retType = mi.getReturnTypeCode();
+            if (retType == Types.T_DOUBLE || retType == Types.T_LONG) {
+                callerFrame.addLongOperandAttr(tag);
+            } else {
+                callerFrame.addOperandAttr(tag);
+            }
         }
-        callerFrame.addOperandAttr(tag);
 
-        String line = "[TaintPropag] " + mi.getFullName() + " (native via-arg) => " + tag;
+        String line = "[TaintPropag] " + mi.getFullName() + " (through) => " + tag;
         System.out.println(line);
         trace(line);
     }
@@ -771,48 +756,37 @@ public class TaintListener extends PropertyListenerAdapter {
         StackFrame callerFrame = ti.getModifiableTopFrame();
         if (callerFrame == null) return;
 
+        // Guard: native methods that fail to push a return value leave the
+        // operand stack empty; addOperandAttr would assert-fail in that case.
+        if (callerFrame.getTopPos() < callerFrame.getLocalVariableCount()) return;
+
         TaintTag tag = new TaintTag(sourceSpec, mi.getFullName());
 
+        // For reference return types: if the callee returned null/0, replace it
+        // with a synthetic heap string so the tag can propagate through later
+        // ALOAD / GETFIELD / invoke instructions.
         if (mi.isReferenceReturnType()) {
-            if (mi instanceof SkippedNativeMethodInfo) {
-                // SkippedNativeMethodInfo.executeNative() returns null for all reference
-                // types; NATIVERETURN skips pushReturnValue when ret==null, so no value
-                // was pushed onto the caller's stack. Push a synthetic tainted String
-                // directly so the tag can propagate through subsequent instructions.
+            int ref = callerFrame.peek();
+            if (ref == MJIEnv.NULL) {
                 ElementInfo ei = ti.getHeap().newString("TAINTED_" + mi.getBaseName(), ti);
                 addTaint(ei, tag);
+                callerFrame.pop();
                 callerFrame.pushRef(ei.getObjectRef());
-                callerFrame.addOperandAttr(tag);
                 String allocLine = "[TaintListener] SOURCE allocated: " + mi.getBaseName();
                 System.out.println(allocLine);
                 trace(allocLine);
             } else {
-                // Regular NATIVERETURN (real peer) or ARETURN: value already on stack.
-                if (callerFrame.getTopPos() < callerFrame.getLocalVariableCount()) return;
-                int ref = callerFrame.peek();
-                if (ref == MJIEnv.NULL) {
-                    ElementInfo ei = ti.getHeap().newString("TAINTED_" + mi.getBaseName(), ti);
-                    addTaint(ei, tag);
-                    callerFrame.pop();
-                    callerFrame.pushRef(ei.getObjectRef());
-                    String allocLine = "[TaintListener] SOURCE allocated: " + mi.getBaseName();
-                    System.out.println(allocLine);
-                    trace(allocLine);
-                } else {
-                    addTaint(ti.getHeap().get(ref), tag);
-                }
-                callerFrame.addOperandAttr(tag);
+                addTaint(ti.getHeap().get(ref), tag);
             }
+        }
+
+        // For double/long (2-slot) returns, taint lives at the high-word slot
+        // (offset 1); use addLongOperandAttr so captureArithmeticTaint finds it.
+        byte retType = mi.getReturnTypeCode();
+        if (retType == Types.T_DOUBLE || retType == Types.T_LONG) {
+            callerFrame.addLongOperandAttr(tag);
         } else {
-            // Primitive return: guard against empty stack.
-            if (callerFrame.getTopPos() < callerFrame.getLocalVariableCount()) return;
-            // For double/long (2-slot) returns, taint lives at the high-word slot.
-            byte retType = mi.getReturnTypeCode();
-            if (retType == Types.T_DOUBLE || retType == Types.T_LONG) {
-                callerFrame.addLongOperandAttr(tag);
-            } else {
-                callerFrame.addOperandAttr(tag);
-            }
+            callerFrame.addOperandAttr(tag);
         }
 
         String line = "[TaintListener] SOURCE found: " + tag;
