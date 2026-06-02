@@ -30,7 +30,10 @@ import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -122,7 +125,10 @@ public class TaintListener extends PropertyListenerAdapter {
         "strip", "stripLeading", "stripTrailing",
         "getBytes", "toCharArray", "encode", "decode",
         "wrap", "copyOf", "copyOfRange", "join", "split",
-        "get", "put", "add", "set"
+        "get", "put", "add", "set",
+        // java.util.regex: taint on the input CharSequence propagates to the Matcher
+        // and from the Matcher to any group() / replaceAll() result.
+        "matcher", "group", "replaceFirst", "appendReplacement", "appendTail"
     ));
 
     // Branch instructions that consume tainted values as conditions → implicit flow.
@@ -138,6 +144,56 @@ public class TaintListener extends PropertyListenerAdapter {
     private TaintTag pendingPropag      = null;  // arithmetic / conversion ops
     private TaintTag pendingInvokeTaint = null;  // taint-through library calls
     private TaintTag pendingBranchTaint = null;  // implicit flow via branch condition
+
+    // Pending side-effect tagging for void TAINT_THROUGH methods (e.g. getChars, format).
+    // Arg refs are captured pre-exec; tainting is applied post-exec in instructionExecuted.
+    private TaintTag pendingVoidTag        = null;
+    private int[]    pendingVoidArgRefs    = null;
+    private boolean[] pendingVoidArgIsRef  = null;
+
+    // ── native taint handoff (SPF→Kharon bridge) ───────────────────────────────
+    //
+    // When SPF detects taint reaching a native app method, it records per-argument
+    // taint detail here.  On searchFinished the records are serialised to
+    // taint.handoff.file so Kharon can initialize the right symbolic variables
+    // as tainted before running angr symbolic execution on the native body.
+
+    private static String handoffFile = null;
+
+    private static final class HandoffArg {
+        final int    javaArgIndex;   // index in getArgumentValues() — 0 = receiver for virtual
+        final int    jniParamIndex;  // index in JNI C signature — 0=env, 1=this/jclass, 2+=params
+        final String javaType;       // e.g. "java.lang.String", "byte[]"
+        final String jniType;        // e.g. "jstring", "jbyteArray", "jint"
+        final String taintSource;    // TaintTag.source  (matches source spec, e.g. "getDeviceId")
+        final String taintOrigin;    // TaintTag.origin  (full method FQN)
+
+        HandoffArg(int javaArgIndex, int jniParamIndex,
+                   String javaType, String jniType,
+                   String taintSource, String taintOrigin) {
+            this.javaArgIndex  = javaArgIndex;
+            this.jniParamIndex = jniParamIndex;
+            this.javaType      = javaType;
+            this.jniType       = jniType;
+            this.taintSource   = taintSource;
+            this.taintOrigin   = taintOrigin;
+        }
+    }
+
+    private static final class HandoffEntry {
+        final String           nativeFqn;
+        final boolean          isStatic;
+        final Set<String>      callerEntrypoints = new LinkedHashSet<>();
+        final List<HandoffArg> taintedArgs       = new ArrayList<>();
+
+        HandoffEntry(String nativeFqn, boolean isStatic) {
+            this.nativeFqn = nativeFqn;
+            this.isStatic  = isStatic;
+        }
+    }
+
+    // keyed by native FQN — accumulated across all symbolic paths
+    private final Map<String, HandoffEntry> nativeHandoffs = new LinkedHashMap<>();
 
     // ── taint helpers ─────────────────────────────────────────────────────────
 
@@ -155,6 +211,15 @@ public class TaintListener extends PropertyListenerAdapter {
 
     private static void addTaint(ElementInfo ei, TaintTag tag) {
         if (ei != null && tag != null && ei.getObjectAttr(TaintTag.class) == null) {
+            ei.addObjectAttr(tag);
+        }
+    }
+
+    /** Taint via ref — uses getModifiable so it is safe to call in pre-exec (executeInstruction). */
+    private static void addTaintRef(ThreadInfo ti, int ref, TaintTag tag) {
+        if (ref == MJIEnv.NULL || tag == null) return;
+        ElementInfo ei = ti.getHeap().getModifiable(ref);
+        if (ei != null && ei.getObjectAttr(TaintTag.class) == null) {
             ei.addObjectAttr(tag);
         }
     }
@@ -223,6 +288,7 @@ public class TaintListener extends PropertyListenerAdapter {
             "send", "exec", "connect", "write", "println",
             "android.util.Log",
             "sendTextMessage", "sendDataMessage", "openConnection");
+        handoffFile = conf.getString("taint.handoff.file", null);
     }
 
     private static ArrayList<String> defaultList(Config conf, String key, String... defs) {
@@ -322,6 +388,9 @@ public class TaintListener extends PropertyListenerAdapter {
         pendingPropag      = null;
         pendingInvokeTaint = null;
         pendingBranchTaint = null;
+        pendingVoidTag     = null;
+        pendingVoidArgRefs = null;
+        pendingVoidArgIsRef = null;
         if (insn instanceof JVMInvokeInstruction) {
             handleInvoke(ti, (JVMInvokeInstruction) insn);
             pendingInvokeTaint = captureInvokeTaint(ti, (JVMInvokeInstruction) insn);
@@ -346,6 +415,18 @@ public class TaintListener extends PropertyListenerAdapter {
             propagateImplicitTaint(ti, pendingBranchTaint);
             pendingBranchTaint = null;
         }
+        // Apply deferred tainting of reference-type args for void TAINT_THROUGH methods.
+        // Called post-exec so addObjectAttr runs when the heap is modifiable.
+        if (pendingVoidTag != null && pendingVoidArgRefs != null) {
+            for (int i = 0; i < pendingVoidArgRefs.length; i++) {
+                if (pendingVoidArgIsRef[i]) {
+                    addTaint(ti.getHeap().get(pendingVoidArgRefs[i]), pendingVoidTag);
+                }
+            }
+            pendingVoidTag     = null;
+            pendingVoidArgRefs = null;
+            pendingVoidArgIsRef = null;
+        }
         if (insn instanceof JVMReturnInstruction) {
             handleSourceReturn(ti, (JVMReturnInstruction) insn);
             applyReturnTaint(ti, (JVMReturnInstruction) insn);
@@ -355,26 +436,27 @@ public class TaintListener extends PropertyListenerAdapter {
 
     @Override
     public void searchFinished(Search search) {
-        if (!traceEnabled || traceLines.isEmpty()) return;
-
-        File out = new File(traceFile);
-        try {
-            File parent = out.getParentFile();
-            if (parent != null) parent.mkdirs();
-
-            FileWriter writer = new FileWriter(out);
+        if (traceEnabled && !traceLines.isEmpty()) {
+            File out = new File(traceFile);
             try {
-                for (String line : traceLines) {
-                    writer.write(line);
-                    writer.write(System.lineSeparator());
+                File parent = out.getParentFile();
+                if (parent != null) parent.mkdirs();
+
+                FileWriter writer = new FileWriter(out);
+                try {
+                    for (String line : traceLines) {
+                        writer.write(line);
+                        writer.write(System.lineSeparator());
+                    }
+                } finally {
+                    writer.close();
                 }
-            } finally {
-                writer.close();
+                System.out.println("[TaintListener] instruction trace written: " + out.getPath());
+            } catch (IOException ioe) {
+                System.out.println("[TaintListener] failed to write instruction trace: " + ioe);
             }
-            System.out.println("[TaintListener] instruction trace written: " + out.getPath());
-        } catch (IOException ioe) {
-            System.out.println("[TaintListener] failed to write instruction trace: " + ioe);
         }
+        writeHandoffJson();
     }
 
     private void trace(String line) {
@@ -542,11 +624,15 @@ public class TaintListener extends PropertyListenerAdapter {
 
     private void handleInvoke(ThreadInfo ti, JVMInvokeInstruction insn) {
         MethodInfo mi = insn.getInvokedMethod(ti);
-        if (mi == null || !matchesAny(mi, sinks)) return;
+        if (mi == null) return;
 
-        // Bare sink names (no '.') like "send" can match app-internal native JNI bridges.
-        // Skip native methods that are not in framework packages.
-        if (mi.isNative() && !isFrameworkClass(mi.getClassName())) return;
+        boolean isSink = matchesAny(mi, sinks);
+        boolean isAppNative = mi.isNative() && !isFrameworkClass(mi.getClassName());
+
+        // App native methods are not necessarily final sinks on the Java side.
+        // They are JNI boundaries for Kharon, so record tainted arguments even
+        // when the native method name does not match taint.sinks.
+        if (!isSink && !(isAppNative && handoffFile != null)) return;
 
         // Explicit taint: argument operand/heap attrs or array element attrs
         TaintTag tag = firstTaintFromInvoke(ti, insn);
@@ -557,11 +643,199 @@ public class TaintListener extends PropertyListenerAdapter {
             implicit = (tag != null);
         }
         if (tag != null) {
-            String kind = implicit ? " (implicit)" : "";
-            String line = "[TaintListener] *** TAINT FLOW DETECTED" + kind + ": "
-                + tag + " -> " + mi.getFullName() + " ***";
-            System.out.println(line);
-            trace(line);
+            if (isSink) {
+                String kind = implicit ? " (implicit)" : "";
+                String line = "[TaintListener] *** TAINT FLOW DETECTED" + kind + ": "
+                    + tag + " -> " + mi.getFullName() + " ***";
+                System.out.println(line);
+                trace(line);
+            }
+
+            // For native app methods: record per-argument taint detail so Kharon can
+            // initialize the correct symbolic variables as tainted before angr SE.
+            if (isAppNative && handoffFile != null && !implicit) {
+                recordNativeHandoff(ti, insn, mi);
+            }
+        }
+    }
+
+    // ── native taint handoff helpers ─────────────────────────────────────────
+
+    /**
+     * Map a Java type name to its JNI equivalent.
+     * Used to tell Kharon which JNI type a tainted argument has so the angr
+     * backend can choose the right stub to mark as returning tainted data
+     * (e.g. GetStringUTFChars for jstring, GetByteArrayElements for jbyteArray).
+     */
+    private static String jniTypeFor(String javaType) {
+        switch (javaType) {
+            case "java.lang.String": return "jstring";
+            case "java.lang.Object": return "jobject";
+            case "java.lang.Class":  return "jclass";
+            case "java.lang.Throwable": return "jthrowable";
+            case "int":     return "jint";
+            case "long":    return "jlong";
+            case "boolean": return "jboolean";
+            case "byte":    return "jbyte";
+            case "char":    return "jchar";
+            case "short":   return "jshort";
+            case "float":   return "jfloat";
+            case "double":  return "jdouble";
+            case "byte[]":    return "jbyteArray";
+            case "int[]":     return "jintArray";
+            case "long[]":    return "jlongArray";
+            case "float[]":   return "jfloatArray";
+            case "double[]":  return "jdoubleArray";
+            case "boolean[]": return "jbooleanArray";
+            case "char[]":    return "jcharArray";
+            case "short[]":   return "jshortArray";
+            default:
+                if (javaType.endsWith("[]")) return "jobjectArray";
+                return "jobject";
+        }
+    }
+
+    /**
+     * Record per-argument taint detail for a native call site.
+     *
+     * jniParamIndex layout (same for static and non-static):
+     *   0 = JNIEnv*  (never tainted, added by JNI ABI)
+     *   1 = jobject (this) or jclass  (for static methods, clazz)
+     *   2 = first explicit Java parameter
+     *   3 = second explicit Java parameter, ...
+     *
+     * javaArgIndex in getArgumentValues():
+     *   0 = receiver (this) for virtual calls, or first param for static
+     *   1 = first explicit param for virtual, or second param for static, ...
+     */
+    private void recordNativeHandoff(ThreadInfo ti, JVMInvokeInstruction insn, MethodInfo mi) {
+        String nativeFqn = mi.getFullName();
+        HandoffEntry entry = nativeHandoffs.computeIfAbsent(
+                nativeFqn, k -> new HandoffEntry(nativeFqn, mi.isStatic()));
+
+        // Record which entrypoint triggered this call
+        MethodInfo callerMethod = ti.getTopFrame().getMethodInfo();
+        if (callerMethod != null) {
+            entry.callerEntrypoints.add(callerMethod.getFullName());
+        }
+
+        // Walk each argument, check for taint, and record it
+        Object[] argValues = insn.getArgumentValues(ti);
+        Object[] argAttrs  = insn.getArgumentAttrs(ti);
+        String[] typeNames = mi.getArgumentTypeNames();  // explicit param types only
+
+        if (argValues == null) return;
+
+        for (int i = 0; i < argValues.length; i++) {
+            TaintTag tag = null;
+
+            // Slot attr
+            if (argAttrs != null && i < argAttrs.length) {
+                tag = firstTaint(argAttrs[i]);
+            }
+            // Heap attr (reference types)
+            if (tag == null && argValues[i] instanceof ElementInfo) {
+                tag = firstTaint((ElementInfo) argValues[i]);
+            }
+
+            if (tag == null) continue;
+
+            // Determine Java type for this argument slot
+            String javaType;
+            int jniParamIndex;
+            if (!mi.isStatic() && i == 0) {
+                // Receiver (this)
+                javaType     = mi.getClassName();
+                jniParamIndex = 1;   // JNI: obj/this at position 1
+            } else {
+                int explicitIdx = mi.isStatic() ? i : i - 1;
+                javaType = (typeNames != null && explicitIdx >= 0 && explicitIdx < typeNames.length)
+                           ? typeNames[explicitIdx] : "java.lang.Object";
+                // Explicit Java parameters always start at JNI slot 2:
+                // slot 0 = JNIEnv*, slot 1 = jobject/jclass.
+                jniParamIndex = explicitIdx + 2;
+            }
+
+            // Avoid duplicates: same native + same arg + same source across paths
+            boolean exists = false;
+            for (HandoffArg a : entry.taintedArgs) {
+                if (a.javaArgIndex == i && a.taintSource.equals(tag.getSource())) {
+                    exists = true;
+                    break;
+                }
+            }
+            if (!exists) {
+                entry.taintedArgs.add(new HandoffArg(
+                    i, jniParamIndex,
+                    javaType, jniTypeFor(javaType),
+                    tag.getSource(), tag.getOrigin()
+                ));
+            }
+        }
+    }
+
+    /** Escape a string for embedding in a JSON literal. */
+    private static String jsonEsc(String s) {
+        if (s == null) return "";
+        return s.replace("\\", "\\\\").replace("\"", "\\\"");
+    }
+
+    /** Serialise nativeHandoffs to the handoff JSON file. */
+    private void writeHandoffJson() {
+        if (handoffFile == null || nativeHandoffs.isEmpty()) return;
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("{\n  \"version\": \"1.0\",\n  \"native_calls\": [\n");
+
+        boolean firstEntry = true;
+        for (HandoffEntry entry : nativeHandoffs.values()) {
+            if (!firstEntry) sb.append(",\n");
+            firstEntry = false;
+
+            sb.append("    {\n");
+            sb.append("      \"native_fqn\": \"").append(jsonEsc(entry.nativeFqn)).append("\",\n");
+            sb.append("      \"is_static\": ").append(entry.isStatic).append(",\n");
+
+            // caller entrypoints array
+            sb.append("      \"caller_entrypoints\": [");
+            boolean firstEp = true;
+            for (String ep : entry.callerEntrypoints) {
+                if (!firstEp) sb.append(", ");
+                firstEp = false;
+                sb.append("\"").append(jsonEsc(ep)).append("\"");
+            }
+            sb.append("],\n");
+
+            // tainted_args array
+            sb.append("      \"tainted_args\": [\n");
+            boolean firstArg = true;
+            for (HandoffArg arg : entry.taintedArgs) {
+                if (!firstArg) sb.append(",\n");
+                firstArg = false;
+                sb.append("        {\n");
+                sb.append("          \"java_arg_index\": ").append(arg.javaArgIndex).append(",\n");
+                sb.append("          \"jni_param_index\": ").append(arg.jniParamIndex).append(",\n");
+                sb.append("          \"java_type\": \"").append(jsonEsc(arg.javaType)).append("\",\n");
+                sb.append("          \"jni_type\": \"").append(jsonEsc(arg.jniType)).append("\",\n");
+                sb.append("          \"taint_source\": \"").append(jsonEsc(arg.taintSource)).append("\",\n");
+                sb.append("          \"taint_origin\": \"").append(jsonEsc(arg.taintOrigin)).append("\"\n");
+                sb.append("        }");
+            }
+            sb.append("\n      ]\n");
+            sb.append("    }");
+        }
+        sb.append("\n  ]\n}\n");
+
+        File out = new File(handoffFile);
+        try {
+            File parent = out.getParentFile();
+            if (parent != null) parent.mkdirs();
+            try (FileWriter fw = new FileWriter(out)) {
+                fw.write(sb.toString());
+            }
+            System.out.println("[TaintHandoff] native boundary file written: " + out.getPath());
+        } catch (IOException e) {
+            System.out.println("[TaintHandoff] failed to write " + out.getPath() + ": " + e);
         }
     }
 
@@ -628,13 +902,37 @@ public class TaintListener extends PropertyListenerAdapter {
      * Pre-exec: if the invoke targets a TAINT_THROUGH library method and at least
      * one argument is tainted, capture the tag so it can be applied to the return
      * value after the call completes.
+     *
+     * Void methods (e.g. String.getChars) are handled by a separate pending
+     * mechanism: see pendingVoidArgRefs / instructionExecuted.
      */
     private TaintTag captureInvokeTaint(ThreadInfo ti, JVMInvokeInstruction insn) {
         MethodInfo mi = insn.getInvokedMethod(ti);
         if (mi == null) return null;
-        if (mi.getReturnTypeName().equals("void")) return null;
         if (!TAINT_THROUGH.contains(mi.getName())) return null;
-        return firstTaintFromInvoke(ti, insn);
+        TaintTag tag = firstTaintFromInvoke(ti, insn);
+        if (tag == null) return null;
+
+        if (mi.getReturnTypeName().equals("void")) {
+            // Void TAINT_THROUGH methods (String.getChars, Formatter.format, …) write
+            // tainted data into reference-type arguments.  Collect arg refs now (pre-exec
+            // while args are still on the stack) and tag them in instructionExecuted.
+            StackFrame frame = ti.getTopFrame();
+            if (frame != null) {
+                int argSize = insn.getArgSize();
+                int[] refs = new int[argSize];
+                boolean[] isRef = new boolean[argSize];
+                for (int slot = 0; slot < argSize; slot++) {
+                    isRef[slot] = frame.isOperandRef(slot);
+                    refs[slot] = frame.peek(slot);
+                }
+                pendingVoidTag = tag;
+                pendingVoidArgRefs = refs;
+                pendingVoidArgIsRef = isRef;
+            }
+            return null;
+        }
+        return tag;
     }
 
     /**
