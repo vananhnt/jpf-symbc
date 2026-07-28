@@ -47,7 +47,7 @@ public class TABLESWITCH extends SwitchInstruction implements gov.nasa.jpf.vm.by
     @Override
     public Instruction execute(ThreadInfo ti) {
         StackFrame sf = ti.getModifiableTopFrame();
-        IntegerExpression sym_v = (IntegerExpression) sf.getOperandAttr();
+        IntegerExpression sym_v = sf.getOperandAttr(IntegerExpression.class);
 
         if (sym_v == null)
             return super.execute(ti);
@@ -67,7 +67,7 @@ public class TABLESWITCH extends SwitchInstruction implements gov.nasa.jpf.vm.by
             cg = ti.getVM().getSystemState().getChoiceGenerator();
             assert (cg instanceof PCChoiceGenerator) : "expected PCChoiceGenerator, got: " + cg;
         }
-        sym_v = (IntegerExpression) sf.getOperandAttr();
+        sym_v = sf.getOperandAttr(IntegerExpression.class);
         int value = sf.pop();
         PathCondition pc;
         // pc is updated with the pc stored in the choice generator above

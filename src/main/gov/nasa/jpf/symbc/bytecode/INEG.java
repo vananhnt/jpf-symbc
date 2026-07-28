@@ -50,7 +50,7 @@ public class INEG extends gov.nasa.jpf.jvm.bytecode.INEG{
 		
 		StackFrame sf = th.getModifiableTopFrame();
 
-		IntegerExpression sym_v1 = (IntegerExpression) sf.getOperandAttr(); 
+		IntegerExpression sym_v1 = sf.getOperandAttr(IntegerExpression.class); 
 		int v1 = sf.pop();
 		
 		//System.out.println("Execute INEG: "+Helper.get(index));

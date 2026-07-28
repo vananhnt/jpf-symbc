@@ -38,7 +38,7 @@ public class IFLT extends gov.nasa.jpf.jvm.bytecode.IFLT {
     public Instruction execute(ThreadInfo ti) {
 
         StackFrame sf = ti.getModifiableTopFrame();
-        IntegerExpression sym_v = (IntegerExpression) sf.getOperandAttr();
+        IntegerExpression sym_v = sf.getOperandAttr(IntegerExpression.class);
 
         if (sym_v == null) { // the condition is concrete
             return super.execute(ti);

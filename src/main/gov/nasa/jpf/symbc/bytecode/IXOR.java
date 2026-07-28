@@ -30,8 +30,8 @@ public class IXOR extends gov.nasa.jpf.jvm.bytecode.IXOR {
 	@Override
 	public Instruction execute (ThreadInfo th) {
 		StackFrame sf = th.getModifiableTopFrame();
-		IntegerExpression sym_v1 = (IntegerExpression) sf.getOperandAttr(0); 
-		IntegerExpression sym_v2 = (IntegerExpression) sf.getOperandAttr(1);
+		IntegerExpression sym_v1 = sf.getOperandAttr(0, IntegerExpression.class); 
+		IntegerExpression sym_v2 = sf.getOperandAttr(1, IntegerExpression.class);
 		
 		if(sym_v1==null && sym_v2==null)
 			return super.execute(th); // we'll still do the concrete execution

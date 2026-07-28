@@ -39,8 +39,8 @@ public class IF_ICMPLE extends gov.nasa.jpf.jvm.bytecode.IF_ICMPLE {
 
         StackFrame sf = ti.getModifiableTopFrame();
 
-        IntegerExpression sym_v1 = (IntegerExpression) sf.getOperandAttr(1);
-        IntegerExpression sym_v2 = (IntegerExpression) sf.getOperandAttr(0);
+        IntegerExpression sym_v1 = sf.getOperandAttr(1, IntegerExpression.class);
+        IntegerExpression sym_v2 = sf.getOperandAttr(0, IntegerExpression.class);
 
         if ((sym_v1 == null) && (sym_v2 == null)) { // both conditions are concrete
             // System.out.println("Execute IF_ICMPLE: The conditions are concrete");

@@ -46,8 +46,8 @@ public class IOR extends gov.nasa.jpf.jvm.bytecode.IOR {
 	@Override
 	public Instruction execute (ThreadInfo th) {
 		StackFrame sf = th.getModifiableTopFrame();
-		IntegerExpression sym_v1 = (IntegerExpression) sf.getOperandAttr(0); 
-		IntegerExpression sym_v2 = (IntegerExpression) sf.getOperandAttr(1);
+		IntegerExpression sym_v1 = sf.getOperandAttr(0, IntegerExpression.class); 
+		IntegerExpression sym_v2 = sf.getOperandAttr(1, IntegerExpression.class);
 		
 		int v1 = sf.pop();
 		int v2 = sf.pop();

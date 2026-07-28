@@ -35,8 +35,8 @@ public class LADD extends gov.nasa.jpf.jvm.bytecode.LADD {
   public Instruction execute (ThreadInfo th) {
 	StackFrame sf = th.getModifiableTopFrame();
 	  
-	IntegerExpression sym_v1 = (IntegerExpression) sf.getOperandAttr(1);
-	IntegerExpression sym_v2 = (IntegerExpression) sf.getOperandAttr(3);
+	IntegerExpression sym_v1 = sf.getOperandAttr(1, IntegerExpression.class);
+	IntegerExpression sym_v2 = sf.getOperandAttr(3, IntegerExpression.class);
     
     if(sym_v1==null && sym_v2==null)
         return super.execute(th);// we'll still do the concrete execution

@@ -10,7 +10,9 @@ import gov.nasa.jpf.search.Search;
 import gov.nasa.jpf.util.MethodSpec;
 import gov.nasa.jpf.util.ObjectList;
 import gov.nasa.jpf.vm.ClassInfo;
+import gov.nasa.jpf.vm.ClassInfoException;
 import gov.nasa.jpf.vm.ElementInfo;
+import gov.nasa.jpf.vm.FieldInfo;
 import gov.nasa.jpf.vm.Instruction;
 import gov.nasa.jpf.vm.MJIEnv;
 import gov.nasa.jpf.vm.MethodInfo;
@@ -113,7 +115,18 @@ public class TaintListener extends PropertyListenerAdapter {
         "ladd","lsub","lmul","ldiv","lrem","lor","land","lxor",
         "lshl","lshr","lushr","lneg",
         "dadd","dsub","dmul","ddiv","drem","dneg",
-        "i2l","i2d","f2l","f2d","l2d","d2l"
+        "i2l","i2d","f2l","f2d","l2d","d2l",
+        "laload","daload"
+    ));
+
+    // Array-load ops: stack before is ..., arrayref, index (index on top, 1 slot).
+    // A tainted INDEX means the loaded value depends on which element was picked
+    // (a table-lookup implicit flow, e.g. lookup[secretChar]) even when the
+    // array's own contents are untainted constants. JPF's built-in array-load
+    // semantics already copy any element-level attr onto the result; this set
+    // additionally taints the result when the *index* itself is tainted.
+    private static final Set<String> ARRAY_LOAD_OPS = new HashSet<>(Arrays.asList(
+        "iaload","laload","faload","daload","aaload","baload","caload","saload"
     ));
 
     // Java library methods that propagate taint from any argument to the return value.
@@ -123,12 +136,18 @@ public class TaintListener extends PropertyListenerAdapter {
         "substring", "trim", "toLowerCase", "toUpperCase",
         "replace", "replaceAll", "replaceFirst", "intern",
         "strip", "stripLeading", "stripTrailing",
-        "getBytes", "toCharArray", "encode", "decode",
+        "getBytes", "toCharArray", "getChars", "encode", "decode",
         "wrap", "copyOf", "copyOfRange", "join", "split",
         "get", "put", "add", "set",
+        // String.equals()/equalsIgnoreCase(): taints the boolean result so a
+        // later branch on it is recognized as a tainted (implicit-flow) condition.
+        "equals", "equalsIgnoreCase",
         // java.util.regex: taint on the input CharSequence propagates to the Matcher
         // and from the Matcher to any group() / replaceAll() result.
-        "matcher", "group", "replaceFirst", "appendReplacement", "appendTail"
+        "matcher", "group", "replaceFirst", "appendReplacement", "appendTail",
+        // ProcessBuilder.command(String...) returns `this`, so tagging the return
+        // value (via applyReturnTaint) taints the receiver itself.
+        "command"
     ));
 
     // Branch instructions that consume tainted values as conditions → implicit flow.
@@ -160,6 +179,76 @@ public class TaintListener extends PropertyListenerAdapter {
 
     private static String handoffFile = null;
 
+    // Native methods whose taint-through behaviour was determined by Kharon.
+    // Loaded from taint.native_through config (comma-separated method specs).
+    // When a call to one of these methods carries tainted args, taint is
+    // propagated to the return value exactly like a Java TAINT_THROUGH method.
+    private static ArrayList<String> nativeTaintThrough = null;
+
+    // Native methods Kharon symbolically executed and found to leak a tainted
+    // argument into an exfiltration API inside the .so.  Loaded from
+    // taint.native_sinks.
+    private static ArrayList<String> nativeConfirmedSinks = null;
+
+    // Native methods Kharon symbolically executed at all, whatever the verdict
+    // (taint.native_analyzed).  Only these are subject to confirmation: a
+    // native method Kharon never looked at keeps the name-based verdict rather
+    // than being silently cleared.
+    private static ArrayList<String> nativeAnalyzed = null;
+
+    // When set (taint.require_confirmed_native_sinks), an app-declared native
+    // method that Kharon analysed is a sink only if Kharon confirmed it.
+    // Java-side name matching cannot distinguish a native method that leaks its
+    // argument from one that ignores it — both look like a tainted value
+    // flowing into a method called "send" — so without native evidence the
+    // name match alone produces false positives.
+    private static boolean requireConfirmedNativeSinks = false;
+
+    // ── native effects (Kharon → SPF, "what the native body did") ────────────
+    //
+    // SPF never executes a native body, so any state change it makes is invisible
+    // and, worse, absent: after `Foo f = setField(c)` both `f` and `c.foo` are
+    // still null, and the Java code NPEs on `f.getData()` before reaching its
+    // sink.  A native effect declares one such change so SPF can replay it:
+    // materialise the objects the native code would have created and mark the
+    // written value tainted (or clean, which models a native sanitiser).
+    //
+    // Config format — taint.native_effects, comma-separated:
+    //     <signature>|<target>|<fieldPath>|<tainted>|<sourceApi>|<aliasArg>
+    //   signature  full JVM signature, e.g. org.x.A.setField(Lorg/x/C;)Lorg/x/F;
+    //   target     "return" or "argN" (N = index into the Java arg list)
+    //   fieldPath  dotted path from the target, may be empty for the target itself
+    //   tainted    1 = write tainted data, 0 = write clean data (sanitiser)
+    //   sourceApi  origin to attribute the taint to, for reporting
+    //   aliasPath  "argM" or "argM.f…": copy the object at this path into the
+    //              target instead of a fresh taint (the native aliased an
+    //              argument or one of its fields); empty if none
+    private static ArrayList<NativeEffect> nativeEffects = null;
+
+    private static final class NativeEffect {
+        final String  signature;
+        final String  target;      // "return" | "argN"
+        final String  fieldPath;   // "" | "data" | "foo.data"
+        final boolean tainted;
+        final String  sourceApi;
+        final String  aliasPath;   // "" = none, else "argM[.f…]"
+
+        NativeEffect(String signature, String target, String fieldPath,
+                     boolean tainted, String sourceApi, String aliasPath) {
+            this.signature = signature;
+            this.target    = target;
+            this.fieldPath = fieldPath;
+            this.tainted   = tainted;
+            this.sourceApi = sourceApi;
+            this.aliasPath = aliasPath;
+        }
+    }
+
+    // Arg refs captured pre-invoke so effects can be applied once the native
+    // call returns (by then the arguments have been popped off the stack).
+    private MethodInfo pendingEffectMethod  = null;
+    private int[]      pendingEffectArgRefs = null;
+
     private static final class HandoffArg {
         final int    javaArgIndex;   // index in getArgumentValues() — 0 = receiver for virtual
         final int    jniParamIndex;  // index in JNI C signature — 0=env, 1=this/jclass, 2+=params
@@ -167,16 +256,21 @@ public class TaintListener extends PropertyListenerAdapter {
         final String jniType;        // e.g. "jstring", "jbyteArray", "jint"
         final String taintSource;    // TaintTag.source  (matches source spec, e.g. "getDeviceId")
         final String taintOrigin;    // TaintTag.origin  (full method FQN)
+        // For array args: indices whose element carries the taint.  null when
+        // the argument is not an array or taint sits on the object itself.
+        final ArrayList<Integer> taintedElements;
 
         HandoffArg(int javaArgIndex, int jniParamIndex,
                    String javaType, String jniType,
-                   String taintSource, String taintOrigin) {
+                   String taintSource, String taintOrigin,
+                   ArrayList<Integer> taintedElements) {
             this.javaArgIndex  = javaArgIndex;
             this.jniParamIndex = jniParamIndex;
             this.javaType      = javaType;
             this.jniType       = jniType;
             this.taintSource   = taintSource;
             this.taintOrigin   = taintOrigin;
+            this.taintedElements = taintedElements;
         }
     }
 
@@ -210,8 +304,22 @@ public class TaintListener extends PropertyListenerAdapter {
     }
 
     private static void addTaint(ElementInfo ei, TaintTag tag) {
-        if (ei != null && tag != null && ei.getObjectAttr(TaintTag.class) == null) {
+        if (ei == null || tag == null) return;
+        if (ei.getObjectAttr(TaintTag.class) == null) {
             ei.addObjectAttr(tag);
+        }
+        // Arrays carry taint as a single object attr (e.g. from a tainted
+        // String.toCharArray()/getChars() return), but reading an element via
+        // *ALOAD only inherits a per-element attr (JPF's built-in array-load
+        // semantics), not the array's object attr. Tag every element too so
+        // those reads see the taint.
+        if (ei.isArray()) {
+            int len = ei.arrayLength();
+            for (int i = 0; i < len; i++) {
+                if (ei.getElementAttr(i, TaintTag.class) == null) {
+                    ei.addElementAttr(i, tag);
+                }
+            }
         }
     }
 
@@ -258,6 +366,28 @@ public class TaintListener extends PropertyListenerAdapter {
         return false;
     }
 
+    /**
+     * Match a method against Kharon's native-method specs.
+     *
+     * Unlike {@link #matchesAny}, a spec carrying a descriptor must match the
+     * method's full signature exactly.  Overloads share a name, so a substring
+     * match on "MainActivity.send" would let a verdict about send(int) decide
+     * the fate of send(String) — for suppression that would silently drop a
+     * real leak in an overload Kharon never looked at.
+     */
+    private static boolean matchesNativeSpec(MethodInfo mi, ArrayList<String> specs) {
+        if (specs == null || specs.isEmpty()) return false;
+        String fullName = mi.getFullName();
+        for (String spec : specs) {
+            if (spec.indexOf('(') >= 0) {
+                if (fullName.equals(spec)) return true;
+            } else if (fullName.contains(spec)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private static String matchingSpec(MethodInfo mi, ArrayList<String> specs) {
         String methodName = mi.getBaseName();
         String fullName = mi.getFullName();
@@ -287,8 +417,59 @@ public class TaintListener extends PropertyListenerAdapter {
         sinks = defaultList(conf, "taint.sinks",
             "send", "exec", "connect", "write", "println",
             "android.util.Log",
-            "sendTextMessage", "sendDataMessage", "openConnection");
+            "sendTextMessage", "sendDataMessage", "openConnection",
+            // dot-qualified so it doesn't over-match unrelated "start" methods
+            // (Thread.start, Service lifecycle, etc.)
+            "ProcessBuilder.start");
         handoffFile = conf.getString("taint.handoff.file", null);
+
+        nativeTaintThrough   = trimmedList(conf, "taint.native_through");
+        nativeConfirmedSinks = trimmedList(conf, "taint.native_sinks");
+        nativeAnalyzed       = trimmedList(conf, "taint.native_analyzed");
+        requireConfirmedNativeSinks =
+            conf.getBoolean("taint.require_confirmed_native_sinks", false);
+
+        nativeEffects = new ArrayList<>();
+        for (String spec : trimmedList(conf, "taint.native_effects")) {
+            String[] p = spec.split("\\|", -1);
+            if (p.length < 4) {
+                System.out.println("[TaintListener] ignoring malformed taint.native_effects entry: " + spec);
+                continue;
+            }
+            String aliasPath = p.length > 5 ? p[5].trim() : "";
+            nativeEffects.add(new NativeEffect(
+                p[0].trim(), p[1].trim(), p[2].trim(),
+                !"0".equals(p[3].trim()),
+                p.length > 4 ? p[4].trim() : "native",
+                aliasPath));
+        }
+        if (!nativeEffects.isEmpty()) {
+            System.out.println("[TaintListener] " + nativeEffects.size()
+                + " native effect(s) loaded from Kharon");
+        }
+    }
+
+    /**
+     * Read a config list of specs that may carry JVM descriptors.
+     *
+     * JPF's Config splits list values on ',' AND ';' (Config.DELIMS), so a JVM
+     * descriptor like "(Ljava/lang/String;)V" would be torn into fragments and
+     * any signature match against it would be meaningless — or worse, a stray
+     * fragment such as ")V" would substring-match every void method. The writer
+     * (SPFRunner._esc_descriptors) escapes each ';' with JPF's own backtick
+     * quote; Config.split consumes the backtick and hands us a clean ';', so
+     * nothing needs undoing here beyond trimming.
+     */
+    private static ArrayList<String> trimmedList(Config conf, String key) {
+        ArrayList<String> list = new ArrayList<>();
+        String[] vals = conf.getStringArray(key);
+        if (vals != null) {
+            for (String v : vals) {
+                String t = v.trim();
+                if (!t.isEmpty()) list.add(t);
+            }
+        }
+        return list;
     }
 
     private static ArrayList<String> defaultList(Config conf, String key, String... defs) {
@@ -321,12 +502,20 @@ public class TaintListener extends PropertyListenerAdapter {
         "android.app.ActivityThread",
         "android.app.AppGlobals",
         "android.content.res.AssetManager",
+        "android.content.res.Resources",
         "android.telephony.TelephonyManager",
         "android.location.Location",
         "libcore.io.OsConstants",
         "libcore.io.Posix",
+        "libcore.icu.NativeConverter",
+        "libcore.icu.ICU",
+        "libcore.icu.LocaleData",
         "dalvik.system.VMRuntime",
         "dalvik.system.VMStack",
+        "dalvik.system.CloseGuard",
+        "java.util.TimeZone",
+        "java.util.Date",
+        "java.util.concurrent.atomic.AtomicLong",
     };
 
     @Override
@@ -428,6 +617,9 @@ public class TaintListener extends PropertyListenerAdapter {
             pendingVoidArgIsRef = null;
         }
         if (insn instanceof JVMReturnInstruction) {
+            // Effects first: a native source materialises its return value here,
+            // and handleSourceReturn/applyReturnTaint then see a real object.
+            applyNativeEffects(ti, (JVMReturnInstruction) insn);
             handleSourceReturn(ti, (JVMReturnInstruction) insn);
             applyReturnTaint(ti, (JVMReturnInstruction) insn);
         }
@@ -575,6 +767,11 @@ public class TaintListener extends PropertyListenerAdapter {
             return taintAtSlot(ti, frame, 1); // 2-slot long/double input (high word)
         }
 
+        // ── array load: taint the result when the index is tainted ──────────
+        if (ARRAY_LOAD_OPS.contains(m)) {
+            return taintAtSlot(ti, frame, 0); // index, always 1-slot int
+        }
+
         return null;
     }
 
@@ -623,11 +820,24 @@ public class TaintListener extends PropertyListenerAdapter {
     // ── invoke / native-return handlers ──────────────────────────────────────
 
     private void handleInvoke(ThreadInfo ti, JVMInvokeInstruction insn) {
-        MethodInfo mi = insn.getInvokedMethod(ti);
+        MethodInfo mi;
+        try {
+            mi = insn.getInvokedMethod(ti);
+        } catch (ClassInfoException cie) {
+            // Invoked class cannot be resolved (e.g. garbled class name from
+            // obfuscated DES-decrypted strings). Skip taint analysis for this call.
+            return;
+        }
         if (mi == null) return;
 
-        boolean isSink = matchesAny(mi, sinks);
         boolean isAppNative = mi.isNative() && !isFrameworkClass(mi.getClassName());
+        boolean isSink = matchesAny(mi, sinks) && !suppressedNativeSink(mi, isAppNative);
+
+        // Capture argument refs for any native method with declared effects, so
+        // they can be replayed once it returns.  Must run before the early exits
+        // below and regardless of taint: a native *source* produces a secret out
+        // of entirely untainted inputs.
+        captureEffectArgs(ti, insn, mi);
 
         // App native methods are not necessarily final sinks on the Java side.
         // They are JNI boundaries for Kharon, so record tainted arguments even
@@ -635,7 +845,7 @@ public class TaintListener extends PropertyListenerAdapter {
         if (!isSink && !(isAppNative && handoffFile != null)) return;
 
         // Explicit taint: argument operand/heap attrs or array element attrs
-        TaintTag tag = firstTaintFromInvoke(ti, insn);
+        TaintTag tag = firstTaintFromInvoke(ti, insn, mi);
         boolean implicit = false;
         if (tag == null) {
             // Implicit taint: current frame was tagged by an earlier branch on tainted data
@@ -656,7 +866,294 @@ public class TaintListener extends PropertyListenerAdapter {
             if (isAppNative && handoffFile != null && !implicit) {
                 recordNativeHandoff(ti, insn, mi);
             }
+            return;
         }
+
+        // No taint on the arguments themselves — but a native call whose argument
+        // *contains* tainted data (c.data, d.str, foo.data) is still a boundary
+        // Kharon must inspect, since the native body can read the field and leak
+        // it. This only opens the handoff; the Java-side verdict is unchanged,
+        // so it cannot create a false positive on its own.
+        if (isAppNative && handoffFile != null) {
+            TaintTag reachable = reachableTaintFromInvoke(ti, insn);
+            if (reachable != null) {
+                trace("[TaintListener] native boundary with field-reachable taint: "
+                      + mi.getFullName() + " <- " + reachable);
+                recordNativeHandoff(ti, insn, mi);
+
+                // A confirmed native sink that Kharon verified reads a tainted
+                // field of its argument (native_complexdata's send reads c.data
+                // via a getter) is a real leak, even though the taint sits in a
+                // field rather than on the argument itself. Gated on Kharon's
+                // confirmation, so it cannot over-report on its own.
+                if (isSink && matchesNativeSpec(mi, nativeConfirmedSinks)) {
+                    String line = "[TaintListener] *** TAINT FLOW DETECTED (field-reachable): "
+                        + reachable + " -> " + mi.getFullName() + " ***";
+                    System.out.println(line);
+                    trace(line);
+                }
+            }
+        }
+    }
+
+    /**
+     * True when a name-matched sink should be ignored because it is an
+     * app-declared native method that Kharon analysed and did not confirm.
+     *
+     * The Java side sees only that a tainted value flows into a method whose
+     * name matches taint.sinks; whether the native body leaks it is decided by
+     * Kharon's symbolic execution of the .so.  Methods Kharon never analysed
+     * are left alone, so this can only remove findings Kharon actively cleared.
+     */
+    private boolean suppressedNativeSink(MethodInfo mi, boolean isAppNative) {
+        if (!requireConfirmedNativeSinks || !isAppNative) return false;
+        if (!matchesNativeSpec(mi, nativeAnalyzed)) return false;
+        boolean confirmed = matchesNativeSpec(mi, nativeConfirmedSinks);
+        if (!confirmed) {
+            String line = "[TaintListener] native sink not confirmed by Kharon, "
+                + "suppressing name match: " + mi.getFullName();
+            System.out.println(line);
+            trace(line);
+        }
+        return !confirmed;
+    }
+
+    // ── native effects: replaying what the native body did ───────────────────
+
+    /** Effects declared for this method, or an empty list. */
+    private ArrayList<NativeEffect> effectsFor(MethodInfo mi) {
+        ArrayList<NativeEffect> out = new ArrayList<>();
+        if (nativeEffects == null || nativeEffects.isEmpty()) return out;
+        String fullName = mi.getFullName();
+        for (NativeEffect e : nativeEffects) {
+            if (e.signature.indexOf('(') >= 0 ? fullName.equals(e.signature)
+                                              : fullName.contains(e.signature)) {
+                out.add(e);
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Pre-invoke: remember the argument references of a native call that has
+     * declared effects, since they are popped by the time it returns.
+     */
+    private void captureEffectArgs(ThreadInfo ti, JVMInvokeInstruction insn, MethodInfo mi) {
+        if (!mi.isNative() || effectsFor(mi).isEmpty()) return;
+        Object[] args = insn.getArgumentValues(ti);
+        StackFrame frame = ti.getTopFrame();
+        if (frame == null) return;
+
+        // Java argument order, receiver excluded — the same indexing Kharon uses
+        // when it reports "argN".
+        String[] typeNames = mi.getArgumentTypeNames();
+        int nArgs = typeNames == null ? 0 : typeNames.length;
+        int[] refs = new int[nArgs];
+        int argSize = insn.getArgSize();
+        // Operand slots run right-to-left: the last argument sits nearest the top.
+        // getArgumentTypeNames() gives dotted names ("org.x.ComplexData", "long"),
+        // not descriptors, so slot width is derived here rather than via Types.
+        int slot = 0;
+        for (int i = nArgs - 1; i >= 0 && slot < argSize; i--) {
+            refs[i] = frame.isOperandRef(slot) ? frame.peek(slot) : MJIEnv.NULL;
+            String t = typeNames[i];
+            slot += ("long".equals(t) || "double".equals(t)) ? 2 : 1;
+        }
+        pendingEffectMethod  = mi;
+        pendingEffectArgRefs = refs;
+    }
+
+    /**
+     * Post-return: apply every declared effect of the native method that just
+     * returned.  Materialises missing objects along the way — without that,
+     * `Foo f = setField(c)` leaves both `f` and `c.foo` null and the app NPEs
+     * before it ever reaches its sink.
+     */
+    private void applyNativeEffects(ThreadInfo ti, JVMReturnInstruction insn) {
+        MethodInfo mi = insn.getMethodInfo();
+        if (mi == null || mi != pendingEffectMethod) return;
+        int[] argRefs = pendingEffectArgRefs;
+        pendingEffectMethod  = null;
+        pendingEffectArgRefs = null;
+
+        StackFrame caller = ti.getModifiableTopFrame();
+        if (caller == null) return;
+
+        for (NativeEffect e : effectsFor(mi)) {
+            try {
+                applyNativeEffect(ti, caller, mi, argRefs, e);
+            } catch (Throwable t) {
+                // An effect is advisory: a malformed path or an unloadable class
+                // must not abort the analysis run.
+                trace("[TaintEffect] could not apply " + e.target + "." + e.fieldPath
+                      + " on " + mi.getFullName() + ": " + t);
+            }
+        }
+    }
+
+    /**
+     * Resolve an alias path ("argM" or "argM.f1.f2") to the heap reference of
+     * the object it names, walking instance fields from the argument. Returns
+     * MJIEnv.NULL if the path is empty, malformed, or hits a null link.
+     */
+    private int resolveAliasRef(ThreadInfo ti, int[] argRefs, String aliasPath) {
+        if (aliasPath == null || aliasPath.isEmpty() || !aliasPath.startsWith("arg")) {
+            return MJIEnv.NULL;
+        }
+        String[] parts = aliasPath.split("\\.");
+        int idx;
+        try {
+            idx = Integer.parseInt(parts[0].substring(3));
+        } catch (NumberFormatException nfe) {
+            return MJIEnv.NULL;
+        }
+        if (argRefs == null || idx < 0 || idx >= argRefs.length) return MJIEnv.NULL;
+        int ref = argRefs[idx];
+        for (int i = 1; i < parts.length && ref != MJIEnv.NULL; i++) {
+            ElementInfo ei = ti.getHeap().get(ref);
+            if (ei == null) return MJIEnv.NULL;
+            FieldInfo fi = ei.getClassInfo().getInstanceField(parts[i]);
+            if (fi == null || !fi.isReference()) return MJIEnv.NULL;
+            ref = ei.getReferenceField(fi);
+        }
+        return ref;
+    }
+
+    private void applyNativeEffect(ThreadInfo ti, StackFrame caller, MethodInfo mi,
+                                   int[] argRefs, NativeEffect e) {
+        ElementInfo base;
+
+        // Aliasing: the native returned/stored one of its arguments (or a field
+        // of one) verbatim. Resolve the path to that object's actual reference,
+        // so its own (possibly deep) taint is what flows — not a fresh, shallower
+        // taint.
+        int aliasRef = resolveAliasRef(ti, argRefs, e.aliasPath);
+        boolean isAlias = aliasRef != MJIEnv.NULL;
+
+        if ("return".equals(e.target)) {
+            if (!mi.isReferenceReturnType()) return;
+            if (caller.getTopPos() < caller.getLocalVariableCount()) return;
+            if (isAlias && e.fieldPath.isEmpty()) {
+                // The return IS the aliased object: put it on the stack.
+                caller.pop();
+                caller.pushRef(aliasRef);
+                trace("[TaintEffect] return aliases " + e.aliasPath
+                      + " for " + mi.getFullName());
+                return;
+            }
+            int ref = caller.peek();
+            if (ref == MJIEnv.NULL) {
+                // The native method returned an object SPF never created.
+                ElementInfo fresh = newInstance(ti, mi.getReturnTypeName());
+                if (fresh == null) return;
+                caller.pop();
+                caller.pushRef(fresh.getObjectRef());
+                trace("[TaintEffect] materialised return " + mi.getReturnTypeName()
+                      + " for " + mi.getFullName());
+                base = fresh;
+            } else {
+                base = ti.getHeap().getModifiable(ref);
+            }
+        } else if (e.target.startsWith("arg")) {
+            int idx;
+            try {
+                idx = Integer.parseInt(e.target.substring(3));
+            } catch (NumberFormatException nfe) {
+                return;
+            }
+            if (argRefs == null || idx < 0 || idx >= argRefs.length) return;
+            if (argRefs[idx] == MJIEnv.NULL) return;
+            base = ti.getHeap().getModifiable(argRefs[idx]);
+        } else {
+            return;
+        }
+        if (base == null) return;
+
+        // Walk the field path, creating objects for null links along the way.
+        String[] path = e.fieldPath.isEmpty() ? new String[0] : e.fieldPath.split("\\.");
+        for (int i = 0; i < path.length - 1; i++) {
+            FieldInfo fi = base.getClassInfo().getInstanceField(path[i]);
+            if (fi == null) return;
+            int ref = base.getReferenceField(fi);
+            if (ref == MJIEnv.NULL) {
+                ElementInfo link = newInstance(ti, fi.getType());
+                if (link == null) return;
+                base.setReferenceField(fi, link.getObjectRef());
+                base = link;
+            } else {
+                base = ti.getHeap().getModifiable(ref);
+            }
+            if (base == null) return;
+        }
+
+        TaintTag tag = new TaintTag(e.sourceApi, mi.getFullName() + " (native effect)");
+
+        if (path.length == 0) {
+            // The target object itself carries the result.
+            if (e.tainted) addTaint(base, tag);
+            else base.removeObjectAttr(tag);
+            logEffect(mi, e, tag);
+            return;
+        }
+
+        FieldInfo fi = base.getClassInfo().getInstanceField(path[path.length - 1]);
+        if (fi == null) return;
+
+        if (!fi.isReference()) {
+            // Primitive field: the taint rides on the owning object.
+            if (e.tainted) addTaint(base, tag);
+            logEffect(mi, e, tag);
+            return;
+        }
+
+        // Aliasing: point the field at the resolved argument object, so its own
+        // (possibly deep) taint is what a later read sees.
+        if (isAlias) {
+            base.setReferenceField(fi, aliasRef);
+            base.setFieldAttr(fi, tag);
+            addTaint(ti.getHeap().getModifiable(aliasRef), tag);
+            logEffect(mi, e, tag);
+            return;
+        }
+
+        // Write a fresh value into the field.  A sanitiser writes a clean string
+        // — which is what the native code did — rather than trying to strip tags
+        // off whatever the field happened to hold.
+        ElementInfo value = ti.getHeap().newString(
+            e.tainted ? "TAINTED_native_" + mi.getBaseName() : "CLEAN_native_" + mi.getBaseName(), ti);
+        base.setReferenceField(fi, value.getObjectRef());
+
+        // The tag must be set/cleared on the field slot as well as the value:
+        // JPF carries a field attr that GETFIELD copies onto the operand, so a
+        // sanitiser that only swapped the reference would leave the old tag to
+        // reach the sink anyway.
+        if (e.tainted) {
+            addTaint(value, tag);
+            base.setFieldAttr(fi, tag);
+        } else {
+            TaintTag stale = base.getFieldAttr(fi, TaintTag.class);
+            if (stale != null) base.removeFieldAttr(fi, stale);
+        }
+        logEffect(mi, e, tag);
+    }
+
+    private void logEffect(MethodInfo mi, NativeEffect e, TaintTag tag) {
+        String line = "[TaintEffect] " + mi.getBaseName() + " -> " + e.target
+            + (e.fieldPath.isEmpty() ? "" : "." + e.fieldPath)
+            + (e.tainted ? " := tainted " + tag : " := cleaned (native sanitiser)");
+        System.out.println(line);
+        trace(line);
+    }
+
+    /** Allocate an instance of {@code typeName}, or null if it cannot be resolved. */
+    private ElementInfo newInstance(ThreadInfo ti, String typeName) {
+        if (typeName == null || typeName.isEmpty()) return null;
+        if (typeName.equals("java.lang.String")) {
+            return ti.getHeap().newString("", ti);
+        }
+        ClassInfo ci = ClassInfo.getInitializedClassInfo(typeName, ti);
+        if (ci == null || ci.isArray() || ci.isInterface()) return null;
+        return ti.getHeap().newObject(ci, ti);
     }
 
     // ── native taint handoff helpers ─────────────────────────────────────────
@@ -704,9 +1201,9 @@ public class TaintListener extends PropertyListenerAdapter {
      *   2 = first explicit Java parameter
      *   3 = second explicit Java parameter, ...
      *
-     * javaArgIndex in getArgumentValues():
-     *   0 = receiver (this) for virtual calls, or first param for static
-     *   1 = first explicit param for virtual, or second param for static, ...
+     * getArgumentValues() returns the explicit declared parameters ONLY — never
+     * the receiver, for either static or instance methods. So argValues[i] is
+     * always the i-th explicit parameter, at JNI slot i+2.
      */
     private void recordNativeHandoff(ThreadInfo ti, JVMInvokeInstruction insn, MethodInfo mi) {
         String nativeFqn = mi.getFullName();
@@ -728,6 +1225,7 @@ public class TaintListener extends PropertyListenerAdapter {
 
         for (int i = 0; i < argValues.length; i++) {
             TaintTag tag = null;
+            ArrayList<Integer> taintedElements = null;
 
             // Slot attr
             if (argAttrs != null && i < argAttrs.length) {
@@ -735,26 +1233,39 @@ public class TaintListener extends PropertyListenerAdapter {
             }
             // Heap attr (reference types)
             if (tag == null && argValues[i] instanceof ElementInfo) {
-                tag = firstTaint((ElementInfo) argValues[i]);
+                ElementInfo ei = (ElementInfo) argValues[i];
+                tag = firstTaint(ei);
+                // Array element attr: for an argument like String[], the taint
+                // sits on an element rather than on the array object itself.
+                // Detection (firstTaintFromInvoke) already looks here, so the
+                // handoff must too — otherwise Kharon is handed a boundary with
+                // no tainted argument to follow into the native body.  Record
+                // which indices carry it: native code that reads a different
+                // element than the one holding the secret does not leak it.
+                if (tag == null && ei.isArray()) {
+                    taintedElements = new ArrayList<>();
+                    tag = taintInArray(ti, ei, taintedElements);
+                }
+                // Taint held in the object's fields rather than on the object
+                // itself. Kharon marks the whole fake object's memory, which is
+                // the right granularity: the native body reaches the secret via
+                // GetObjectField on exactly that memory.
+                if (tag == null) {
+                    tag = reachableTaint(ti, ei, MAX_TAINT_DEPTH, new HashSet<Integer>());
+                    if (tag != null) taintedElements = null;
+                }
             }
 
             if (tag == null) continue;
 
-            // Determine Java type for this argument slot
-            String javaType;
-            int jniParamIndex;
-            if (!mi.isStatic() && i == 0) {
-                // Receiver (this)
-                javaType     = mi.getClassName();
-                jniParamIndex = 1;   // JNI: obj/this at position 1
-            } else {
-                int explicitIdx = mi.isStatic() ? i : i - 1;
-                javaType = (typeNames != null && explicitIdx >= 0 && explicitIdx < typeNames.length)
-                           ? typeNames[explicitIdx] : "java.lang.Object";
-                // Explicit Java parameters always start at JNI slot 2:
-                // slot 0 = JNIEnv*, slot 1 = jobject/jclass.
-                jniParamIndex = explicitIdx + 2;
-            }
+            // argValues[i] is the i-th explicit parameter (receiver excluded),
+            // whose JNI slot is i+2: slot 0 = JNIEnv*, slot 1 = jobject/jclass,
+            // then the explicit parameters. This holds for static and instance
+            // methods alike — the earlier receiver/off-by-one adjustment was
+            // wrong and mislabelled e.g. setField(c, f)'s tainted f as c.
+            String javaType = (typeNames != null && i < typeNames.length)
+                              ? typeNames[i] : "java.lang.Object";
+            int jniParamIndex = i + 2;
 
             // Avoid duplicates: same native + same arg + same source across paths
             boolean exists = false;
@@ -768,7 +1279,8 @@ public class TaintListener extends PropertyListenerAdapter {
                 entry.taintedArgs.add(new HandoffArg(
                     i, jniParamIndex,
                     javaType, jniTypeFor(javaType),
-                    tag.getSource(), tag.getOrigin()
+                    tag.getSource(), tag.getOrigin(),
+                    taintedElements
                 ));
             }
         }
@@ -818,8 +1330,16 @@ public class TaintListener extends PropertyListenerAdapter {
                 sb.append("          \"java_type\": \"").append(jsonEsc(arg.javaType)).append("\",\n");
                 sb.append("          \"jni_type\": \"").append(jsonEsc(arg.jniType)).append("\",\n");
                 sb.append("          \"taint_source\": \"").append(jsonEsc(arg.taintSource)).append("\",\n");
-                sb.append("          \"taint_origin\": \"").append(jsonEsc(arg.taintOrigin)).append("\"\n");
-                sb.append("        }");
+                sb.append("          \"taint_origin\": \"").append(jsonEsc(arg.taintOrigin)).append("\"");
+                if (arg.taintedElements != null && !arg.taintedElements.isEmpty()) {
+                    sb.append(",\n          \"tainted_element_indices\": [");
+                    for (int e = 0; e < arg.taintedElements.size(); e++) {
+                        if (e > 0) sb.append(", ");
+                        sb.append(arg.taintedElements.get(e));
+                    }
+                    sb.append("]");
+                }
+                sb.append("\n        }");
             }
             sb.append("\n      ]\n");
             sb.append("    }");
@@ -839,7 +1359,7 @@ public class TaintListener extends PropertyListenerAdapter {
         }
     }
 
-    private TaintTag firstTaintFromInvoke(ThreadInfo ti, JVMInvokeInstruction insn) {
+    private TaintTag firstTaintFromInvoke(ThreadInfo ti, JVMInvokeInstruction insn, MethodInfo mi) {
         // Path 1: operand-slot attrs on argument positions
         if (insn.hasArgumentAttr(ti, TaintTag.class)) {
             Object[] attrs = insn.getArgumentAttrs(ti);
@@ -868,6 +1388,23 @@ public class TaintListener extends PropertyListenerAdapter {
             }
         }
 
+        // Path 3: receiver ("this") object taint for instance calls.
+        // getArgumentValues() only returns explicit declared parameters, never
+        // the receiver, so a receiver tainted by an earlier call (e.g.
+        // ProcessBuilder.command() tainting `this` via its return-this pattern)
+        // would otherwise be invisible to a later no-arg call like start().
+        if (!mi.isStatic()) {
+            StackFrame frame = ti.getTopFrame();
+            int recvSlot = insn.getArgSize() - 1;
+            if (frame != null && recvSlot >= 0 && frame.isOperandRef(recvSlot)) {
+                int ref = frame.peek(recvSlot);
+                if (ref != MJIEnv.NULL) {
+                    TaintTag tag = firstTaint(ti.getHeap().get(ref));
+                    if (tag != null) return tag;
+                }
+            }
+        }
+
         return null;
     }
 
@@ -877,23 +1414,111 @@ public class TaintListener extends PropertyListenerAdapter {
      * large arrays that are unlikely to carry taint past that point.
      */
     private TaintTag firstTaintInArray(ThreadInfo ti, ElementInfo ei) {
+        return taintInArray(ti, ei, null);
+    }
+
+    // Depth/breadth caps for reachableTaint. Depth 4 covers the wrapper nesting
+    // these samples use (ComplexData -> Foo -> String) with room to spare;
+    // the field cap bounds work on wide framework objects.
+    private static final int MAX_TAINT_DEPTH  = 4;
+    private static final int MAX_TAINT_FIELDS = 32;
+
+    /**
+     * Find taint reachable from an object through its reference fields.
+     *
+     * {@link #firstTaint(ElementInfo)} only reads an object's own attr, so taint
+     * stored *inside* an argument is invisible: after {@code c.setData(imei)}
+     * the tainted String lives in {@code c.data} while {@code c} itself carries
+     * no tag. A native call {@code send(c)} then looks clean and no JNI boundary
+     * is recorded, so Kharon is never asked whether the native body leaks it.
+     *
+     * Used only to decide that a native boundary is worth handing to Kharon —
+     * deliberately NOT used for Java-side sink reporting, where reachability
+     * (as opposed to the value actually flowing to the sink) would over-report.
+     */
+    private TaintTag reachableTaint(ThreadInfo ti, ElementInfo ei,
+                                    int depth, HashSet<Integer> seen) {
+        if (ei == null || depth < 0) return null;
+        if (!seen.add(ei.getObjectRef())) return null;   // cycle guard
+
+        TaintTag tag = firstTaint(ei);
+        if (tag != null) return tag;
+
+        if (ei.isArray()) {
+            tag = taintInArray(ti, ei, null);
+            if (tag != null) return tag;
+            String cn = ei.getClassInfo() == null ? "" : ei.getClassInfo().getName();
+            if (cn.startsWith("[L") || cn.startsWith("[[")) {
+                int len = Math.min(ei.arrayLength(), MAX_TAINT_FIELDS);
+                for (int i = 0; i < len; i++) {
+                    int ref = ei.getReferenceElement(i);
+                    if (ref == MJIEnv.NULL) continue;
+                    tag = reachableTaint(ti, ti.getHeap().get(ref), depth - 1, seen);
+                    if (tag != null) return tag;
+                }
+            }
+            return null;
+        }
+
+        int n = Math.min(ei.getNumberOfFields(), MAX_TAINT_FIELDS);
+        for (int i = 0; i < n; i++) {
+            FieldInfo fi = ei.getFieldInfo(i);
+            if (fi == null || !fi.isReference()) continue;
+            int ref = ei.getReferenceField(fi);
+            if (ref == MJIEnv.NULL) continue;
+            tag = reachableTaint(ti, ti.getHeap().get(ref), depth - 1, seen);
+            if (tag != null) return tag;
+        }
+        return null;
+    }
+
+    /** Reachable taint on any argument of a native call, or null. */
+    private TaintTag reachableTaintFromInvoke(ThreadInfo ti, JVMInvokeInstruction insn) {
+        Object[] args = insn.getArgumentValues(ti);
+        if (args == null) return null;
+        for (Object arg : args) {
+            if (!(arg instanceof ElementInfo)) continue;
+            TaintTag tag = reachableTaint(
+                ti, (ElementInfo) arg, MAX_TAINT_DEPTH, new HashSet<Integer>());
+            if (tag != null) return tag;
+        }
+        return null;
+    }
+
+    /**
+     * Scan array elements for taint, optionally collecting the indices that
+     * carry it.
+     *
+     * Which element is tainted matters to the native side: a library that reads
+     * arr[4] does not leak an IMEI stored at arr[1].  Kharon can only make that
+     * distinction if the handoff says which indices to mark, so callers pass a
+     * list here to record them.
+     *
+     * @param taintedIndices if non-null, every tainted index found is added and
+     *                       the scan continues; otherwise it stops at the first.
+     */
+    private TaintTag taintInArray(ThreadInfo ti, ElementInfo ei,
+                                  ArrayList<Integer> taintedIndices) {
         int len = Math.min(ei.arrayLength(), 64);
         String className = ei.getClassInfo().getName();
         // Reference arrays: "[Ljava/lang/String;" starts with "[L", multi-dim with "[["
         boolean isRefArray = className.startsWith("[L") || className.startsWith("[[");
+        TaintTag first = null;
 
         for (int i = 0; i < len; i++) {
             TaintTag tag = firstTaint(ei.getElementAttr(i));
-            if (tag != null) return tag;
-            if (isRefArray) {
+            if (tag == null && isRefArray) {
                 int ref = ei.getReferenceElement(i);
                 if (ref != MJIEnv.NULL) {
                     tag = firstTaint(ti.getHeap().get(ref));
-                    if (tag != null) return tag;
                 }
             }
+            if (tag == null) continue;
+            if (first == null) first = tag;
+            if (taintedIndices == null) return first;
+            if (!taintedIndices.contains(i)) taintedIndices.add(i);
         }
-        return null;
+        return first;
     }
 
     // ── taint-through library calls ───────────────────────────────────────────
@@ -909,9 +1534,21 @@ public class TaintListener extends PropertyListenerAdapter {
     private TaintTag captureInvokeTaint(ThreadInfo ti, JVMInvokeInstruction insn) {
         MethodInfo mi = insn.getInvokedMethod(ti);
         if (mi == null) return null;
-        if (!TAINT_THROUGH.contains(mi.getName())) return null;
-        TaintTag tag = firstTaintFromInvoke(ti, insn);
+
+        boolean isTaintThrough = TAINT_THROUGH.contains(mi.getName());
+        boolean isNativeTaintThrough = mi.isNative()
+            && nativeTaintThrough != null && !nativeTaintThrough.isEmpty()
+            && matchesAny(mi, nativeTaintThrough);
+
+        if (!isTaintThrough && !isNativeTaintThrough) return null;
+        TaintTag tag = firstTaintFromInvoke(ti, insn, mi);
         if (tag == null) return null;
+
+        if (isNativeTaintThrough) {
+            String line = "[TaintNativeThrough] " + mi.getFullName() + " => " + tag;
+            System.out.println(line);
+            trace(line);
+        }
 
         if (mi.getReturnTypeName().equals("void")) {
             // Void TAINT_THROUGH methods (String.getChars, Formatter.format, …) write
@@ -980,7 +1617,15 @@ public class TaintListener extends PropertyListenerAdapter {
 
         if (mi.isReferenceReturnType()) {
             int ref = callerFrame.peek();
-            if (ref != MJIEnv.NULL) {
+            if (ref == MJIEnv.NULL && insn instanceof NATIVERETURN) {
+                // SkippedNativeMethodInfo returns integer 0 (NULL ref).
+                // Replace with a synthetic tainted string so taint propagates
+                // through subsequent field/operand accesses.
+                ElementInfo ei = ti.getHeap().newString("TAINTED_native_" + mi.getBaseName(), ti);
+                addTaint(ei, tag);
+                callerFrame.pop();
+                callerFrame.pushRef(ei.getObjectRef());
+            } else if (ref != MJIEnv.NULL) {
                 addTaint(ti.getHeap().get(ref), tag);
             }
             callerFrame.addOperandAttr(tag);

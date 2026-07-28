@@ -17,6 +17,7 @@
  */
 package gov.nasa.jpf.symbc.bytecode;
 
+import gov.nasa.jpf.vm.ClassInfo;
 import gov.nasa.jpf.vm.Instruction;
 import gov.nasa.jpf.vm.MethodInfo;
 import gov.nasa.jpf.vm.ThreadInfo;
@@ -41,7 +42,8 @@ public class INVOKEINTERFACE extends gov.nasa.jpf.jvm.bytecode.INVOKEINTERFACE{
 		    MethodInfo mi = getInvokedMethod(th, objRef);
 
 		    if (mi == null) {
-		      String clsName = th.getClassInfo(objRef).getName();
+		      ClassInfo ci = th.getClassInfo(objRef);
+		      String clsName = ci != null ? ci.getName() : "unknown";
 		      return th.createAndThrowException("java.lang.NoSuchMethodError", clsName + '.' + mname);
 		    }
 		BytecodeUtils.InstructionOrSuper nextInstr = BytecodeUtils.execute(this, th);

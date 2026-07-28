@@ -319,7 +319,7 @@ public class SymbolicStringHandler {
 
 	private boolean handleCharAt (JVMInvokeInstruction invInst, ThreadInfo th) {
 		StackFrame sf = th.getModifiableTopFrame();
-		IntegerExpression sym_v1 = (IntegerExpression) sf.getOperandAttr(0);
+		IntegerExpression sym_v1 = sf.getOperandAttr(0, IntegerExpression.class);
 		StringExpression sym_v2 = (StringExpression) sf.getOperandAttr(1);
 		boolean bresult = false;
 		if ((sym_v1 == null) & (sym_v2 == null)) {
@@ -441,7 +441,7 @@ public class SymbolicStringHandler {
 		Expression sym_v2 = null;
 		IntegerExpression intExp = null;
 		sym_v1 = (StringExpression) sf.getOperandAttr(2);
-		intExp = (IntegerExpression) sf.getOperandAttr(0);
+		intExp = sf.getOperandAttr(0, IntegerExpression.class);
 		sym_v2 = sf.getOperandAttr(1, Expression.class);
 
 		if (sym_v1 == null && sym_v2 == null && intExp == null) {
@@ -608,7 +608,7 @@ public class SymbolicStringHandler {
 		StringExpression sym_v2 = null;
 		IntegerExpression intExp = null;
 		sym_v1 = (StringExpression) sf.getOperandAttr(2);
-		intExp = (IntegerExpression) sf.getOperandAttr(0);
+		intExp = sf.getOperandAttr(0, IntegerExpression.class);
 		sym_v2 = (StringExpression) sf.getOperandAttr(1);
 
 		if (sym_v1 == null && sym_v2 == null && intExp == null) {
@@ -1006,7 +1006,7 @@ public class SymbolicStringHandler {
 
 	public Instruction handleSubString1(JVMInvokeInstruction invInst, ThreadInfo th) {
 		StackFrame sf = th.getModifiableTopFrame();
-		IntegerExpression sym_v1 = (IntegerExpression) sf.getOperandAttr(0);
+		IntegerExpression sym_v1 = sf.getOperandAttr(0, IntegerExpression.class);
 		StringExpression sym_v2 = (StringExpression) sf.getOperandAttr(1);
 
 		if ((sym_v1 == null) & (sym_v2 == null)) {
@@ -1043,8 +1043,8 @@ public class SymbolicStringHandler {
 	public Instruction handleSubString2(JVMInvokeInstruction invInst, ThreadInfo th) {
 		//System.out.println("[SymbolicStringHandler] doing");
 		StackFrame sf = th.getModifiableTopFrame();
-		IntegerExpression sym_v1 = (IntegerExpression) sf.getOperandAttr(0);
-		IntegerExpression sym_v2 = (IntegerExpression) sf.getOperandAttr(1);
+		IntegerExpression sym_v1 = sf.getOperandAttr(0, IntegerExpression.class);
+		IntegerExpression sym_v2 = sf.getOperandAttr(1, IntegerExpression.class);
 		StringExpression sym_v3 = (StringExpression) sf.getOperandAttr(2);
 
 		if ((sym_v1 == null) & (sym_v2 == null) & (sym_v3 == null)) {
@@ -1917,7 +1917,7 @@ public class SymbolicStringHandler {
 
 	public Instruction handleIntValueOf(JVMInvokeInstruction invInst,  ThreadInfo th) {
 		StackFrame sf = th.getModifiableTopFrame();
-		IntegerExpression sym_v1 = (IntegerExpression) sf.getOperandAttr(0);
+		IntegerExpression sym_v1 = sf.getOperandAttr(0, IntegerExpression.class);
 
 		if (sym_v1 == null) {
 			throw new RuntimeException("ERROR: symbolic string method must have symbolic operand: handleIntValueOf");
@@ -1958,7 +1958,7 @@ public class SymbolicStringHandler {
 
 	public Instruction handleLongValueOf(JVMInvokeInstruction invInst, ThreadInfo th) {
 		StackFrame sf = th.getModifiableTopFrame();
-		IntegerExpression sym_v1 = (IntegerExpression) sf.getOperandAttr(0);
+		IntegerExpression sym_v1 = sf.getOperandAttr(0, IntegerExpression.class);
 
 		if (sym_v1 == null) {
 			throw new RuntimeException("ERROR: symbolic string method must have symbolic operand: handleLongValueOf");
@@ -1998,7 +1998,7 @@ public class SymbolicStringHandler {
 
 	public Instruction handleBooleanValueOf(JVMInvokeInstruction invInst, ThreadInfo th) {
 		StackFrame sf = th.getModifiableTopFrame();
-		IntegerExpression sym_v1 = (IntegerExpression) sf.getOperandAttr(0);
+		IntegerExpression sym_v1 = sf.getOperandAttr(0, IntegerExpression.class);
 
 		if (sym_v1 == null) {
 			throw new RuntimeException("ERROR: symbolic string method must have symbolic operand: handleBooleanValueOf");
@@ -2217,8 +2217,8 @@ public class SymbolicStringHandler {
 	public Instruction handleStringAppend3(JVMInvokeInstruction invInst, ThreadInfo th) {
 		StackFrame sf = th.getModifiableTopFrame();
 		
-		IntegerExpression sym_end = (IntegerExpression) sf.getOperandAttr(0);
-		IntegerExpression sym_start = (IntegerExpression) sf.getOperandAttr(1);
+		IntegerExpression sym_end = sf.getOperandAttr(0, IntegerExpression.class);
+		IntegerExpression sym_start = sf.getOperandAttr(1, IntegerExpression.class);
 		StringExpression sym_string = (StringExpression) sf.getOperandAttr(2);
 		SymbolicStringBuilder sym_builder = (SymbolicStringBuilder) sf.getOperandAttr(3);
 
@@ -2343,7 +2343,7 @@ public class SymbolicStringHandler {
 	public void handleCharAppend(JVMInvokeInstruction invInst, ThreadInfo th) {
 
 		StackFrame sf = th.getModifiableTopFrame();
-		IntegerExpression sym_v1 = (IntegerExpression) sf.getOperandAttr(0);
+		IntegerExpression sym_v1 = sf.getOperandAttr(0, IntegerExpression.class);
 		SymbolicStringBuilder sym_v2 = (SymbolicStringBuilder) sf.getOperandAttr(1);
 
 		if (sym_v2 == null)
@@ -2376,7 +2376,7 @@ public class SymbolicStringHandler {
 	public void handleByteAppend(JVMInvokeInstruction invInst, ThreadInfo th) {
 
 		StackFrame sf = th.getModifiableTopFrame();
-		IntegerExpression sym_v1 = (IntegerExpression) sf.getOperandAttr(0);
+		IntegerExpression sym_v1 = sf.getOperandAttr(0, IntegerExpression.class);
 		SymbolicStringBuilder sym_v2 = (SymbolicStringBuilder) sf.getOperandAttr(1);
 
 		if (sym_v2 == null)
@@ -2409,7 +2409,7 @@ public class SymbolicStringHandler {
 	public void handleShortAppend(JVMInvokeInstruction invInst, ThreadInfo th) {
 
 		StackFrame sf = th.getModifiableTopFrame();
-		IntegerExpression sym_v1 = (IntegerExpression) sf.getOperandAttr(0);
+		IntegerExpression sym_v1 = sf.getOperandAttr(0, IntegerExpression.class);
 		SymbolicStringBuilder sym_v2 = (SymbolicStringBuilder) sf.getOperandAttr(1);
 
 		if (sym_v2 == null)
@@ -2442,7 +2442,7 @@ public class SymbolicStringHandler {
 	public void handleIntAppend(JVMInvokeInstruction invInst, ThreadInfo th) {
 
 		StackFrame sf = th.getModifiableTopFrame();
-		IntegerExpression sym_v1 = (IntegerExpression) sf.getOperandAttr(0);
+		IntegerExpression sym_v1 = sf.getOperandAttr(0, IntegerExpression.class);
 		SymbolicStringBuilder sym_v2 = (SymbolicStringBuilder) sf.getOperandAttr(1);
 
 		if (sym_v2 == null)
@@ -2507,7 +2507,7 @@ public class SymbolicStringHandler {
 
 	public void handleBooleanAppend(JVMInvokeInstruction invInst, ThreadInfo th) {
 		StackFrame sf = th.getModifiableTopFrame();
-		IntegerExpression sym_v1 = (IntegerExpression) sf.getOperandAttr(0);
+		IntegerExpression sym_v1 = sf.getOperandAttr(0, IntegerExpression.class);
 		SymbolicStringBuilder sym_v2 = (SymbolicStringBuilder) sf.getOperandAttr(1);
 
 		if (sym_v2 == null)
@@ -2550,7 +2550,7 @@ public class SymbolicStringHandler {
 	public void handleLongAppend(JVMInvokeInstruction invInst, ThreadInfo th) {
 
 		StackFrame sf = th.getModifiableTopFrame();
-		IntegerExpression sym_v1 = (IntegerExpression) sf.getOperandAttr(0);
+		IntegerExpression sym_v1 = sf.getOperandAttr(0, IntegerExpression.class);
 		SymbolicStringBuilder sym_v2 = (SymbolicStringBuilder) sf.getOperandAttr(2);
 
 		if (sym_v2 == null)
